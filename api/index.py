@@ -1,4 +1,4 @@
-From flask import Flask, request, jsonify
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import re
@@ -40,14 +40,11 @@ def extract_domain(url):
 def api_endpoint():
     global request_count, success_count
     
-    # Get parameters
     bypass_url = request.args.get('bypass')
     api_key = request.args.get('key')
     
-    # Start timing
     start_time = time.time()
     
-    # 1. API Key validation (only ONE key, no showing valid keys)
     if not verify_key(api_key):
         return jsonify({
             "success": False,
@@ -55,7 +52,6 @@ def api_endpoint():
             "api_developer": DEVELOPER
         }), 401
     
-    # 2. Check if URL provided
     if not bypass_url:
         return jsonify({
             "success": False,
@@ -65,11 +61,8 @@ def api_endpoint():
         }), 400
     
     request_count += 1
-    
-    # 3. Get domain
     domain = extract_domain(bypass_url)
     
-    # 4. Check if it's the specific original link
     if ORIGINAL_LINK in bypass_url or "godx1767110927511" in bypass_url:
         success_count += 1
         processing_time = time.time() - start_time
@@ -86,7 +79,6 @@ def api_endpoint():
             "version": VERSION
         })
     
-    # 5. Check if domain is supported
     is_supported = False
     for supported_domain in SUPPORTED_DOMAINS:
         if domain and supported_domain in domain:
@@ -101,9 +93,7 @@ def api_endpoint():
             "api_developer": DEVELOPER
         }), 400
     
-    # 6. Basic bypass attempt for other links
     try:
-        # Follow redirects
         response = requests.get(bypass_url, allow_redirects=True, timeout=15)
         final_url = response.url
         
@@ -123,10 +113,7 @@ def api_endpoint():
                 "version": VERSION
             })
         else:
-            # Try to extract from HTML
             html = response.text
-            
-            # Look for URLs in HTML
             url_patterns = [
                 r'window\.location\.href\s*=\s*["\']([^"\']+)["\']',
                 r'<meta.*?url=([^"\']+)["\']',
@@ -172,7 +159,6 @@ def api_endpoint():
 
 @app.route('/')
 def home():
-    """Home page - shows API info without exposing keys"""
     return jsonify({
         "name": "Link Bypass API",
         "description": "Bypass URL shorteners easily",
@@ -186,7 +172,6 @@ def home():
 
 @app.route('/api/original', methods=['GET'])
 def original_link():
-    """Quick access to the specific original link bypass"""
     api_key = request.args.get('key')
     
     if not verify_key(api_key):
@@ -208,7 +193,6 @@ def original_link():
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """Get API statistics (protected)"""
     api_key = request.args.get('key')
     
     if not verify_key(api_key):
@@ -230,7 +214,6 @@ def get_stats():
 
 @app.route('/api/check', methods=['GET'])
 def check_domain():
-    """Check if a domain is supported"""
     url = request.args.get('url')
     api_key = request.args.get('key')
     
@@ -277,32 +260,3 @@ def internal_error(error):
         "error": "Internal server error",
         "api_developer": DEVELOPER
     }), 500
-
-if __name__ == '__main__':
-    print(f"""
-    ╔══════════════════════════════════════════════════╗
-    ║         Link Bypass API - {DEVELOPER}              ║
-    ╠══════════════════════════════════════════════════╣
-    ║  Version: {VERSION}                                         ║
-    ║  API Key: [HIDDEN - Contact Developer]           ║
-    ║                                                  ║
-    ║  Supported Domains:                              ║
-    ║  • vplink.in                                     ║
-    ║  • adsfly.in                                     ║
-    ║  • linksgo.in                                    ║
-    ║  • just2earn.com                                 ║
-    ║                                                  ║
-    ║  Original Link:                                  ║
-    ║  {ORIGINAL_LINK[:50]}...  ║
-    ║                                                  ║
-    ║  Bypassed Link:                                  ║
-    ║  {BYPASSED_LINK[:50]}...  ║
-    ║                                                  ║
-    ║  Test Commands:                                  ║
-    ║  curl "http://localhost:5000/api?bypass={ORIGINAL_LINK[:30]}...&key=Farhan"  ║
-    ║                                                  ║
-    ║  curl http://localhost:5000/api/original?key=Farhan  ║
-    ╚══════════════════════════════════════════════════╝
-    """)
-    app.run(debug=True, host='0.0.0.0', port=5000)
-
