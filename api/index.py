@@ -1,11 +1,10 @@
 from flask import Flask, request, jsonify
 import requests
 import re
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse, parse_qs
 
 app = Flask(__name__)
 
-# Thêm CORS trực tiếp vào header để frontend GitHub Pages gọi thoải mái không bị chặn
 @app.after_request
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
@@ -30,14 +29,27 @@ def bypass_via_worker(target_url):
 def fallback_parser(target_url):
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Referer': 'https://link4m.com/'
         }
-        res = requests.get(target_url, headers=headers, allow_redirects=True, timeout=8)
-        match = re.search(r'href=["\'](https?://[^"\']+)["\']', res.text, re.IGNORECASE)
-        if match:
-            return match.group(1)
-        return res.url
-    except Exception:
+        res = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
+        
+        # Thử tìm link ẩn trong thẻ input hoặc script của trang đích
+        match_url = re.search(r'https?://[^\s<>"]+|www\.[^\s<>"]+', res.text)
+        
+        # Nếu trang trả về chứa các URL chuyển hướng ẩn
+        if res.url != target_url:
+            return res.url
+            
+        # Tìm kiếm các pattern chuyển hướng dạng mã hóa thông dụng
+        if match_url:
+            found = match_url.group(0)
+            if "link4m" not in found and "google" not in found:
+                return found.rstrip('\'">')
+                
+        return target_url
+    except Exception as e:
+        print(f"Fallback Error: {e}")
         return target_url
 
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
@@ -60,10 +72,12 @@ def bypass_endpoint():
 
     url = unquote(str(url)).strip()
 
+    # Thử gọi Worker trước
     bypassed = bypass_via_worker(url)
     method_used = "cloudflare_worker"
 
-    if not bypassed:
+    # Nếu Worker không trả kết quả hoặc trả về nguyên link cũ, dùng fallback
+    if not bypassed or bypassed == url:
         bypassed = fallback_parser(url)
         method_used = "python_fallback"
 
