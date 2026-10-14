@@ -11,7 +11,7 @@ CORS(app)
 # ========== CONFIGURATION ==========
 VALID_API_KEY = "Farhan"
 DEVELOPER = "@FarhanXMods"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 ORIGINAL_LINK = "https://just2earn.com/godx1767110927511"
 BYPASSED_LINK = "https://mypdftools.site/ankitkey?deviceId=rand-1767110927483-g5lxha5&verify=57c4582f6cfcb79f955337dca51dca674b98eef8788c6e7419c62db4"
@@ -71,20 +71,26 @@ def api_endpoint():
         return jsonify({"success": False, "error": f"Domain not supported: {domain}", "domain": domain, "api_developer": DEVELOPER}), 400
     
     try:
-        # Giả lập trình duyệt thực tế để tránh bị chặn bot
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Connection': 'keep-alive'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
         }
         
         session = requests.Session()
         response = session.get(bypass_url, headers=headers, allow_redirects=True, timeout=20)
         final_url = response.url
         
-        # Nếu URL sau khi request khác URL ban đầu (đã qua redirect tự động)
-        if final_url != bypass_url and not "link4m" in final_url:
+        # Kiểm tra nếu dính trang challenge của Cloudflare thì báo lỗi chuyên biệt
+        if "challenges.cloudflare.com" in final_url or "cloudflare" in response.text.lower() and "ray id" in response.text.lower():
+            return jsonify({
+                "success": False,
+                "error": "Trang web đích bị bảo vệ bởi Cloudflare Captcha. Không thể tự động bóc tách.",
+                "domain": domain,
+                "api_developer": DEVELOPER
+            }), 400
+
+        if final_url != bypass_url and "link4m" not in final_url and "challenges.cloudflare.com" not in final_url:
             success_count += 1
             processing_time = time.time() - start_time
             return jsonify({
@@ -100,25 +106,19 @@ def api_endpoint():
         else:
             html = response.text
             
-            # Mở rộng danh sách regex tìm kiếm link chuyển hướng ẩn bên trong trang
+            # Quét tìm các liên kết ẩn dạng http/https nhưng loại trừ domain rác và cloudflare
             url_patterns = [
-                r'window\.location\.href\s*=\s*["\']([^"\']+)["\']',
-                r'<meta\s+http-equiv="refresh"\s+content="[^;]+;\s*url=([^"\']+)"',
-                r'<meta.*?url=([^"\']+)["\']',
-                r'<a[^>]*id="download-button"[^>]*href=["\']([^"\']+)"',
-                r'<a[^>]*class="[^"]*btn[^"]*"[^>]*href=["\'](http[s]?://[^"\']+)["\']',
-                r'data-url=["\']([^"\']+)["\']',
-                r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+                r'window\.location\.href\s*=\s*["\'](http[s]?://[^"\']+)["\']',
+                r'url\s*=\s*["\'](http[s]?://[^"\']+)["\']',
+                r'href=["\'](http[s]?://[^"\']+)["\']'
             ]
             
             extracted_url = None
             for pattern in url_patterns:
                 matches = re.findall(pattern, html)
-                for match in matches:
-                    url_candidate = match[0] if isinstance(match, tuple) else match
-                    # Lọc bỏ các link nội bộ hoặc link rác của trang shortener
-                    if url_candidate.startswith('http') and domain not in url_candidate and 'javascript' not in url_candidate:
-                        extracted_url = url_candidate
+                for candidate in matches:
+                    if domain not in candidate and "cloudflare" not in candidate and "google" not in candidate:
+                        extracted_url = candidate
                         break
                 if extracted_url:
                     break
@@ -137,7 +137,7 @@ def api_endpoint():
                     "version": VERSION
                 })
             
-            return jsonify({"success": False, "error": "Could not bypass link. Target page protected.", "domain": domain, "api_developer": DEVELOPER}), 400
+            return jsonify({"success": False, "error": "Không tìm thấy link đích (Trang có thể yêu cầu tương tác thủ công).", "domain": domain, "api_developer": DEVELOPER}), 400
             
     except Exception as e:
         return jsonify({"success": False, "error": str(e), "api_developer": DEVELOPER}), 400
@@ -146,9 +146,7 @@ def api_endpoint():
 def home():
     return jsonify({
         "name": "Link Bypass API",
-        "description": "Bypass URL shorteners easily",
         "version": VERSION,
-        "endpoint": "/api?bypass=YOUR_URL&key=YOUR_KEY",
         "supported_domains": SUPPORTED_DOMAINS,
         "api_developer": DEVELOPER
     })
