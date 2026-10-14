@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cloudscraper
+import requests
 import re
 import time
 from urllib.parse import urlparse
@@ -11,7 +12,7 @@ CORS(app)
 # ========== CONFIGURATION ==========
 VALID_API_KEY = "Farhan"
 DEVELOPER = "@FarhanXMods"
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 ORIGINAL_LINK = "https://just2earn.com/godx1767110927511"
 BYPASSED_LINK = "https://mypdftools.site/ankitkey?deviceId=rand-1767110927483-g5lxha5&verify=57c4582f6cfcb79f955337dca51dca674b98eef8788c6e7419c62db4"
@@ -71,20 +72,12 @@ def api_endpoint():
         return jsonify({"success": False, "error": f"Domain not supported: {domain}", "domain": domain, "api_developer": DEVELOPER}), 400
     
     try:
-        # Sử dụng cloudscraper để vượt qua tường lửa Cloudflare của link4m
-        scraper = cloudscraper.create_scraper(
-            browser={
-                'browser': 'chrome',
-                'platform': 'windows',
-                'desktop': True
-            }
-        )
-        
-        response = scraper.get(bypass_url, timeout=25)
+        # 1. Thử bóc tách bằng cloudscraper trước
+        scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
+        response = scraper.get(bypass_url, timeout=20)
         final_url = response.url
         html = response.text
         
-        # Kiểm tra nếu lấy được link chuyển hướng trực tiếp khác trang ban đầu
         if final_url != bypass_url and "link4m" not in final_url and "challenges.cloudflare.com" not in final_url:
             success_count += 1
             processing_time = time.time() - start_time
@@ -99,7 +92,7 @@ def api_endpoint():
                 "version": VERSION
             })
         
-        # Quét tìm các định dạng URL ẩn được mã hóa trong mã nguồn trang đích
+        # Quét Regex tìm link ẩn
         url_patterns = [
             r'window\.location\.href\s*=\s*["\'](http[s]?://[^"\']+)["\']',
             r'url\s*=\s*["\'](http[s]?://[^"\']+)["\']',
@@ -131,7 +124,34 @@ def api_endpoint():
                 "version": VERSION
             })
         
-        return jsonify({"success": False, "error": "Không thể bóc tách link. Trang web yêu cầu xác thực nâng cao.", "domain": domain, "api_developer": DEVELOPER}), 400
+        # 2. Cơ chế Fallback gọi qua API trung gian chuyên dụng mạnh mẽ hơn
+        proxy_apis = [
+            f"https://bypass.pmh.workers.dev/?url={bypass_url}",
+            f"https://api.bypass.vip/bypass?url={bypass_url}"
+        ]
+        
+        for p_api in proxy_apis:
+            try:
+                p_res = requests.get(p_api, timeout=12)
+                p_data = p_res.json()
+                destination = p_data.get("destination") or p_data.get("bypassed_url") or p_data.get("url")
+                if destination and destination.startswith('http'):
+                    success_count += 1
+                    processing_time = time.time() - start_time
+                    return jsonify({
+                        "success": True,
+                        "original_url": bypass_url,
+                        "bypassed_url": destination,
+                        "domain": domain,
+                        "method": "proxy_fallback",
+                        "processing_time": f"{processing_time:.2f}s",
+                        "api_developer": DEVELOPER,
+                        "version": VERSION
+                    })
+            except:
+                continue
+
+        return jsonify({"success": False, "error": "Không thể bẻ khóa link do tường lửa quá mạnh.", "domain": domain, "api_developer": DEVELOPER}), 400
             
     except Exception as e:
         return jsonify({"success": False, "error": str(e), "api_developer": DEVELOPER}), 400
