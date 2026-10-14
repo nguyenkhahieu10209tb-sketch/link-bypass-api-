@@ -1,12 +1,17 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import requests
 import re
 from urllib.parse import unquote
 
 app = Flask(__name__)
-# Bật CORS cho phép frontend GitHub Pages gọi API thoải mái
-CORS(app)
+
+# Thêm CORS trực tiếp vào header để frontend GitHub Pages gọi thoải mái không bị chặn
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    return response
 
 CF_WORKER_URL = "https://dry-dew-91c7.nguyenkhahieu10209tb.workers.dev/?url="
 
@@ -28,7 +33,6 @@ def fallback_parser(target_url):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         res = requests.get(target_url, headers=headers, allow_redirects=True, timeout=8)
-        
         match = re.search(r'href=["\'](https?://[^"\']+)["\']', res.text, re.IGNORECASE)
         if match:
             return match.group(1)
@@ -36,10 +40,12 @@ def fallback_parser(target_url):
     except Exception:
         return target_url
 
-# Hỗ trợ cả đường dẫn gốc lẫn /api/bypass để frontend gọi kiểu gì cũng trúng
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
 @app.route('/api/bypass', methods=['GET', 'POST', 'OPTIONS'])
 def bypass_endpoint():
+    if request.method == 'OPTIONS':
+        return '', 204
+        
     if request.method == 'POST':
         data = request.get_json(silent=True) or {}
         url = data.get('url') or request.form.get('url')
@@ -49,12 +55,11 @@ def bypass_endpoint():
     if not url:
         return jsonify({
             "status": "online",
-            "message": "Galaxy Bypass API is ready. Please pass 'url' parameter."
+            "message": "Galaxy Bypass API is ready."
         }), 200
 
     url = unquote(str(url)).strip()
 
-    # Thử gọi Worker trước
     bypassed = bypass_via_worker(url)
     method_used = "cloudflare_worker"
 
@@ -66,7 +71,7 @@ def bypass_endpoint():
         "success": True,
         "original_url": url,
         "bypassed_url": bypassed,
-        "destination": bypassed, # dự phòng tên biến cho frontend cũ
+        "destination": bypassed,
         "method": method_used
     })
 
