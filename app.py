@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import requests
 import re
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 app = Flask(__name__)
 
@@ -22,7 +22,8 @@ def bypass_via_worker(target_url):
             data = response.json()
             if data.get("success") and data.get("bypassed_url"):
                 bypassed = data["bypassed_url"]
-                if "challenges.cloudflare.com" in bypassed:
+                # Chặn tuyệt đối nếu dính link challenge từ Worker trả về
+                if "challenges.cloudflare.com" in bypassed or "onrender.com" in bypassed:
                     return None
                 return bypassed
     except Exception as e:
@@ -37,16 +38,22 @@ def fallback_parser(target_url):
         }
         res = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
         
+        # Nếu trang trả về bị kẹt ở trang challenge của Cloudflare
         if "challenges.cloudflare.com" in res.url or "cf-turnstile" in res.text:
             return None
             
         if res.url != target_url and "challenges.cloudflare.com" not in res.url:
-            return res.url
+            parsed_target = urlparse(target_url).netloc
+            parsed_res = urlparse(res.url).netloc
+            if parsed_res and parsed_res != parsed_target and "onrender.com" not in res.url and "github.io" not in res.url:
+                return res.url
             
+        # Tìm kiếm các link trong nội dung HTML nhưng lọc bỏ toàn bộ link rác và domain hệ thống
         matches = re.findall(r'https?://[^\s<>"]+', res.text)
         for link in matches:
-            if not any(x in link for x in ["cloudflare", "link4m", "google", "jquery", "jsdelivr"]):
-                return link.rstrip('\'">')
+            if not any(x in link for x in ["cloudflare", "link4m", "google", "jquery", "jsdelivr", "onrender.com", "github.io"]):
+                if link != target_url:
+                    return link.rstrip('\'">')
                 
         return None
     except Exception as e:
@@ -74,18 +81,21 @@ def bypass_endpoint():
 
     url = unquote(str(url)).strip()
 
+    # Thử gọi Worker trước
     bypassed = bypass_via_worker(url)
     method_used = "cloudflare_worker"
 
+    # Nếu Worker không thành công, chạy fallback python
     if not bypassed:
         bypassed = fallback_parser(url)
         method_used = "python_fallback"
 
-    if not bypassed or "challenges.cloudflare.com" in bypassed:
+    # Kiểm tra lần cuối: Nếu vẫn không tìm được hoặc lòi ra link challenge/link nội bộ
+    if not bypassed or "challenges.cloudflare.com" in bypassed or "onrender.com" in bypassed:
         return jsonify({
             "success": False,
             "original_url": url,
-            "error": "Link bị bảo vệ bởi Cloudflare Turnstile, không thể vượt tự động."
+            "error": "Link bị bảo vệ bởi Cloudflare Turnstile hoặc không tìm thấy đích đến hợp lệ."
         }), 200
 
     return jsonify({
