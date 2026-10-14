@@ -21,7 +21,11 @@ def bypass_via_worker(target_url):
         if response.status_code == 200:
             data = response.json()
             if data.get("success") and data.get("bypassed_url"):
-                return data["bypassed_url"]
+                bypassed = data["bypassed_url"]
+                # Chặn tuyệt đối nếu dính link challenge từ Worker trả về
+                if "challenges.cloudflare.com" in bypassed:
+                    return None
+                return bypassed
     except Exception as e:
         print(f"Worker Error: {e}")
     return None
@@ -34,23 +38,23 @@ def fallback_parser(target_url):
         }
         res = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
         
-        # Thử tìm link ẩn trong thẻ input hoặc script của trang đích
-        match_url = re.search(r'https?://[^\s<>"]+|www\.[^\s<>"]+', res.text)
-        
-        # Nếu trang trả về chứa các URL chuyển hướng ẩn
-        if res.url != target_url:
+        # Nếu trang trả về bị kẹt ở trang challenge của Cloudflare
+        if "challenges.cloudflare.com" in res.url or "cf-turnstile" in res.text:
+            return None
+            
+        if res.url != target_url and "challenges.cloudflare.com" not in res.url:
             return res.url
             
-        # Tìm kiếm các pattern chuyển hướng dạng mã hóa thông dụng
-        if match_url:
-            found = match_url.group(0)
-            if "link4m" not in found and "google" not in found:
-                return found.rstrip('\'">')
+        # Tìm kiếm các link trong nội dung HTML nhưng lọc bỏ rác
+        matches = re.findall(r'https?://[^\s<>"]+', res.text)
+        for link in matches:
+            if not any(x in link for x in ["cloudflare", "link4m", "google", "jquery", "jsdelivr"]):
+                return link.rstrip('\'">')
                 
-        return target_url
+        return None
     except Exception as e:
         print(f"Fallback Error: {e}")
-        return target_url
+        return None
 
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
 @app.route('/api/bypass', methods=['GET', 'POST', 'OPTIONS'])
@@ -76,10 +80,18 @@ def bypass_endpoint():
     bypassed = bypass_via_worker(url)
     method_used = "cloudflare_worker"
 
-    # Nếu Worker không trả kết quả hoặc trả về nguyên link cũ, dùng fallback
-    if not bypassed or bypassed == url:
+    # Nếu Worker không thành công, chạy fallback python
+    if not bypassed:
         bypassed = fallback_parser(url)
         method_used = "python_fallback"
+
+    # Kiểm tra lần cuối: Nếu vẫn không tìm được hoặc lòi ra link challenge
+    if not bypassed or "challenges.cloudflare.com" in bypassed:
+        return jsonify({
+            "success": False,
+            "original_url": url,
+            "error": "Link bị bảo vệ bởi Cloudflare Turnstile, không thể vượt tự động."
+        }), 200
 
     return jsonify({
         "success": True,
