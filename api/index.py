@@ -16,8 +16,8 @@ VERSION = "1.0.0"
 ORIGINAL_LINK = "https://just2earn.com/godx1767110927511"
 BYPASSED_LINK = "https://mypdftools.site/ankitkey?deviceId=rand-1767110927483-g5lxha5&verify=57c4582f6cfcb79f955337dca51dca674b98eef8788c6e7419c62db4"
 
-# Đã thêm link4m.net vào đây để API chấp nhận
-SUPPORTED_DOMAINS = ["vplink.in", "adsfly.in", "linksgo.in", "just2earn.com", "link4m.net"]
+# Đã bổ sung đầy đủ link4m.com và link4m.net vào đây
+SUPPORTED_DOMAINS = ["vplink.in", "adsfly.in", "linksgo.in", "just2earn.com", "link4m.net", "link4m.com"]
 
 request_count = 0
 success_count = 0
