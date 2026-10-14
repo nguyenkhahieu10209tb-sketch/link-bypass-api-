@@ -1,8 +1,9 @@
+import os
+import time
+from urllib.parse import unquote
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from playwright.sync_api import sync_api
-import time
-from urllib.parse import unquote
 
 app = Flask(__name__)
 CORS(app)
@@ -51,7 +52,7 @@ def bypass_with_playwright(target_url):
                         if btn.is_visible():
                             btn.click(timeout=1000)
                             time.sleep(2)
-                except:
+                except Exception:
                     pass
                 
                 time.sleep(1)
@@ -85,7 +86,7 @@ def bypass_endpoint():
     if not url:
         return jsonify({
             "status": "online",
-            "message": "Galaxy Bypass Playwright API on Hugging Face is ready."
+            "message": "Galaxy Bypass Playwright API is ready."
         }), 200
 
     url = unquote(str(url)).strip()
@@ -96,7 +97,7 @@ def bypass_endpoint():
         return jsonify({
             "success": False,
             "original_url": url,
-            "error": "Không thể vượt qua bộ bảo vệ Turnstile hoặc hết thời gian chờ."
+            "error": "Không thể xử lý liên kết hoặc hết thời gian chờ."
         }), 200
 
     return jsonify({
@@ -108,4 +109,5 @@ def bypass_endpoint():
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=7860)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
