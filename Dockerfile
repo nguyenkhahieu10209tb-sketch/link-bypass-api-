@@ -1,54 +1,43 @@
+# Sử dụng Python 3.10 mỏng nhẹ
 FROM python:3.10-slim
 
-# Cài đặt các thư viện hệ thống cần thiết cho Chromium/Playwright
+# Thiết lập thư mục làm việc
+WORKDIR /app
+
+# Cài đặt các gói hệ thống cần thiết cho trình duyệt (đã sửa lỗi libext6)
 RUN apt-get update && apt-get install -y \
     wget \
     curl \
     gnupg \
-    libglib2.0-0 \
     libnss3 \
-    libnspr4 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
     libcups2 \
     libdrm2 \
-    libdbus-1-3 \
-    libexpat1 \
-    libfontconfig1 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
     libgbm1 \
     libpango-1.0-0 \
-    libx11-6 \
-    libx11-xcb1 \
-    libxcb1 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrandr2 \
-    libxrender1 \
-    libxss1 \
-    libxtst6 \
-    ca-certificates \
-    fonts-liberation \
-    libappindicator3-1 \
+    libcairo2 \
     libasound2 \
-    xdg-utils \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
+# Sao chép và cài đặt các thư viện Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Cài đặt trình duyệt Chromium cho Playwright
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Nếu dùng Playwright, tải trình duyệt đi kèm
+RUN playwright install chromium || true
 
+# Sao chép toàn bộ mã nguồn vào container
 COPY . .
 
-# Hugging Face Spaces mặc định chạy port 7860
-EXPOSE 7860
+# Khai báo cổng chạy (khớp với ứng dụng app.py)
+EXPOSE 8080
 
+# Lệnh khởi chạy ứng dụng
 CMD ["python", "app.py"]
