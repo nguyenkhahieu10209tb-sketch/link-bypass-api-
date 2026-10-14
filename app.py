@@ -57,6 +57,7 @@ def fallback_parser(target_url):
         return None
 
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/bypass', methods=['GET', 'POST', 'OPTIONS'])        # Đã thêm route này để khớp Frontend
 @app.route('/api/bypass', methods=['GET', 'POST', 'OPTIONS'])
 def bypass_endpoint():
     if request.method == 'OPTIONS':
