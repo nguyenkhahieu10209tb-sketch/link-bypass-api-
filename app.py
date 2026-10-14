@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify
-import requests
-import re
-from urllib.parse import unquote, urlparse
+from flask_cors import CORS
+from playwright.sync_api import sync_api
+import time
+from urllib.parse import unquote
 
 app = Flask(__name__)
+CORS(app)
 
 @app.after_request
 def add_cors_headers(response):
@@ -12,52 +14,59 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
     return response
 
-CF_WORKER_URL = "https://dry-dew-91c7.nguyenkhahieu10209tb.workers.dev/?url="
-
-def bypass_via_worker(target_url):
+def bypass_with_playwright(target_url):
     try:
-        worker_endpoint = f"{CF_WORKER_URL}{target_url}"
-        response = requests.get(worker_endpoint, timeout=12)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("success") and data.get("bypassed_url"):
-                bypassed = data["bypassed_url"]
-                # Chặn tuyệt đối nếu dính link challenge từ Worker trả về
-                if "challenges.cloudflare.com" in bypassed or "onrender.com" in bypassed:
-                    return None
-                return bypassed
-    except Exception as e:
-        print(f"Worker Error: {e}")
-    return None
-
-def fallback_parser(target_url):
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Referer': 'https://link4m.com/'
-        }
-        res = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
-        
-        # Nếu trang trả về bị kẹt ở trang challenge của Cloudflare
-        if "challenges.cloudflare.com" in res.url or "cf-turnstile" in res.text:
-            return None
+        with sync_api() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox', 
+                    '--disable-dev-shm-usage', 
+                    '--disable-gpu',
+                    '--disable-software-rasterizer'
+                ]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
+            page = context.new_page()
             
-        if res.url != target_url and "challenges.cloudflare.com" not in res.url:
-            parsed_target = urlparse(target_url).netloc
-            parsed_res = urlparse(res.url).netloc
-            if parsed_res and parsed_res != parsed_target and "onrender.com" not in res.url and "github.io" not in res.url:
-                return res.url
+            page.goto(target_url, timeout=35000, wait_until="networkidle")
             
-        # Tìm kiếm các link trong nội dung HTML nhưng lọc bỏ toàn bộ link rác và domain hệ thống
-        matches = re.findall(r'https?://[^\s<>"]+', res.text)
-        for link in matches:
-            if not any(x in link for x in ["cloudflare", "link4m", "google", "jquery", "jsdelivr", "onrender.com", "github.io"]):
-                if link != target_url:
-                    return link.rstrip('\'">')
+            start_time = time.time()
+            final_url = None
+            
+            while time.time() - start_time < 25:
+                current_url = page.url
                 
-        return None
+                if current_url != target_url and "challenges.cloudflare.com" not in current_url and "link4m" not in current_url:
+                    final_url = current_url
+                    break
+                
+                try:
+                    for selector in ['button:has-text("Lấy mã")', 'button:has-text("Tiếp tục")', '#continue-btn', '.get-link', 'a:has-text("Lấy mã")']:
+                        btn = page.locator(selector).first
+                        if btn.is_visible():
+                            btn.click(timeout=1000)
+                            time.sleep(2)
+                except:
+                    pass
+                
+                time.sleep(1)
+                
+            if not final_url:
+                final_url = page.url
+                
+            browser.close()
+            
+            if "challenges.cloudflare.com" in final_url or final_url == target_url:
+                return None
+            return final_url
+            
     except Exception as e:
-        print(f"Fallback Error: {e}")
+        print(f"Playwright Error: {e}")
         return None
 
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
@@ -76,26 +85,18 @@ def bypass_endpoint():
     if not url:
         return jsonify({
             "status": "online",
-            "message": "Galaxy Bypass API is ready."
+            "message": "Galaxy Bypass Playwright API on Hugging Face is ready."
         }), 200
 
     url = unquote(str(url)).strip()
 
-    # Thử gọi Worker trước
-    bypassed = bypass_via_worker(url)
-    method_used = "cloudflare_worker"
+    bypassed = bypass_with_playwright(url)
 
-    # Nếu Worker không thành công, chạy fallback python
     if not bypassed:
-        bypassed = fallback_parser(url)
-        method_used = "python_fallback"
-
-    # Kiểm tra lần cuối: Nếu vẫn không tìm được hoặc lòi ra link challenge/link nội bộ
-    if not bypassed or "challenges.cloudflare.com" in bypassed or "onrender.com" in bypassed:
         return jsonify({
             "success": False,
             "original_url": url,
-            "error": "Link bị bảo vệ bởi Cloudflare Turnstile hoặc không tìm thấy đích đến hợp lệ."
+            "error": "Không thể vượt qua bộ bảo vệ Turnstile hoặc hết thời gian chờ."
         }), 200
 
     return jsonify({
@@ -103,8 +104,8 @@ def bypass_endpoint():
         "original_url": url,
         "bypassed_url": bypassed,
         "destination": bypassed,
-        "method": method_used
+        "method": "playwright_browser"
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=7860)
