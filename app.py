@@ -1,11 +1,9 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-from playwright.sync_api import sync_api
-import time
+import requests
+import re
 from urllib.parse import unquote
 
 app = Flask(__name__)
-CORS(app)
 
 @app.after_request
 def add_cors_headers(response):
@@ -14,65 +12,45 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
     return response
 
-def bypass_with_playwright(target_url):
+CF_WORKER_URL = "https://dry-dew-91c7.nguyenkhahieu10209tb.workers.dev/?url="
+
+def bypass_via_worker(target_url):
     try:
-        with sync_api() as p:
-            # Khởi động Chromium ở chế độ headless với các cờ tối ưu cho server Linux
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox', 
-                    '--disable-setuid-sandbox', 
-                    '--disable-dev-shm-usage', 
-                    '--disable-gpu',
-                    '--disable-software-rasterizer'
-                ]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
-            )
-            page = context.new_page()
-            
-            # Truy cập trang đích
-            page.goto(target_url, timeout=35000, wait_until="networkidle")
-            
-            start_time = time.time()
-            final_url = None
-            
-            # Vòng lặp chờ đợi chuyển hướng hoặc xử lý các nút bấm (tối đa 25 giây)
-            while time.time() - start_time < 25:
-                current_url = page.url
-                
-                # Nếu URL đã thay đổi sang trang đích (khác link rút gọn ban đầu và không kẹt challenge)
-                if current_url != target_url and "challenges.cloudflare.com" not in current_url and "link4m" not in current_url:
-                    final_url = current_url
-                    break
-                
-                # Cố gắng tìm và bấm vào các nút lấy mã / tiếp tục nếu trang yêu cầu
-                try:
-                    for selector in ['button:has-text("Lấy mã")', 'button:has-text("Tiếp tục")', '#continue-btn', '.get-link', 'a:has-text("Lấy mã")']:
-                        btn = page.locator(selector).first
-                        if btn.is_visible():
-                            btn.click(timeout=1000)
-                            time.sleep(2)
-                except:
-                    pass
-                
-                time.sleep(1)
-                
-            if not final_url:
-                final_url = page.url
-                
-            browser.close()
-            
-            # Kiểm tra nếu vẫn dính bẫy Cloudflare hoặc chưa đổi URL thì báo lỗi
-            if "challenges.cloudflare.com" in final_url or final_url == target_url:
-                return None
-            return final_url
-            
+        worker_endpoint = f"{CF_WORKER_URL}{target_url}"
+        response = requests.get(worker_endpoint, timeout=12)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success") and data.get("bypassed_url"):
+                bypassed = data["bypassed_url"]
+                if "challenges.cloudflare.com" in bypassed:
+                    return None
+                return bypassed
     except Exception as e:
-        print(f"Playwright Error: {e}")
+        print(f"Worker Error: {e}")
+    return None
+
+def fallback_parser(target_url):
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Referer': 'https://link4m.com/'
+        }
+        res = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
+        
+        if "challenges.cloudflare.com" in res.url or "cf-turnstile" in res.text:
+            return None
+            
+        if res.url != target_url and "challenges.cloudflare.com" not in res.url:
+            return res.url
+            
+        matches = re.findall(r'https?://[^\s<>"]+', res.text)
+        for link in matches:
+            if not any(x in link for x in ["cloudflare", "link4m", "google", "jquery", "jsdelivr"]):
+                return link.rstrip('\'">')
+                
+        return None
+    except Exception as e:
+        print(f"Fallback Error: {e}")
         return None
 
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
@@ -91,19 +69,23 @@ def bypass_endpoint():
     if not url:
         return jsonify({
             "status": "online",
-            "message": "Galaxy Bypass Playwright API is ready."
+            "message": "Galaxy Bypass API is ready."
         }), 200
 
     url = unquote(str(url)).strip()
 
-    # Tiến hành chạy bypass bằng Playwright
-    bypassed = bypass_with_playwright(url)
+    bypassed = bypass_via_worker(url)
+    method_used = "cloudflare_worker"
 
     if not bypassed:
+        bypassed = fallback_parser(url)
+        method_used = "python_fallback"
+
+    if not bypassed or "challenges.cloudflare.com" in bypassed:
         return jsonify({
             "success": False,
             "original_url": url,
-            "error": "Không thể vượt qua bộ bảo vệ hoặc hết thời gian chờ (Timeout)."
+            "error": "Link bị bảo vệ bởi Cloudflare Turnstile, không thể vượt tự động."
         }), 200
 
     return jsonify({
@@ -111,7 +93,7 @@ def bypass_endpoint():
         "original_url": url,
         "bypassed_url": bypassed,
         "destination": bypassed,
-        "method": "playwright_browser"
+        "method": method_used
     })
 
 if __name__ == '__main__':
