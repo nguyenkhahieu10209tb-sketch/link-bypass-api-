@@ -72,17 +72,25 @@ def bypass_with_playwright(target_url):
 
                 if not final_url:
                     final_url = page.url
+
+                # Chụp lại trang trình duyệt đang thấy, để biết nó bị kẹt ở đâu
+                debug = {"final_url": page.url}
+                try:
+                    debug["title"] = page.title()
+                    debug["text"] = page.inner_text("body")[:400]
+                except Exception as de:
+                    debug["debug_error"] = str(de)
             finally:
                 # Luôn đóng trình duyệt để không tốn RAM (gói free chỉ có 512MB)
                 browser.close()
 
             if "challenges.cloudflare.com" in final_url or final_url == target_url:
-                return None
-            return final_url
+                return None, debug
+            return final_url, debug
 
     except Exception as e:
         print(f"Playwright Error: {e}")
-        return None
+        return None, {"exception": str(e)}
 
 
 @app.route('/', methods=['GET', 'POST', 'OPTIONS'])
@@ -106,13 +114,14 @@ def bypass_endpoint():
 
     url = unquote(str(url)).strip()
 
-    bypassed = bypass_with_playwright(url)
+    bypassed, debug = bypass_with_playwright(url)
 
     if not bypassed:
         return jsonify({
             "success": False,
             "original_url": url,
-            "error": "Không thể xử lý liên kết hoặc hết thời gian chờ."
+            "error": "Không thể xử lý liên kết hoặc hết thời gian chờ.",
+            "debug": debug
         }), 200
 
     return jsonify({
