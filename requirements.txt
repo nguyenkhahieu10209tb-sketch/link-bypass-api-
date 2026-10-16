@@ -1,3 +1,4 @@
+playwright
 flask
 flask-cors
 gunicorn
