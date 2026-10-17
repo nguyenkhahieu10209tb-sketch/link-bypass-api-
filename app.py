@@ -7,7 +7,7 @@ import random
 import time
 import threading
 from urllib.parse import urlparse
-from flask import Flask, request, jsonify, redirect, Response
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
 
@@ -28,18 +28,8 @@ BROWSER_ARGS = [
 JOBS = {}
 JOB_LOCK = threading.Lock()
 
-STYLE = (
-    '<meta name="viewport" content="width=device-width,initial-scale=1">'
-    '<style>body{background:#111;color:#eee;font-family:sans-serif;padding:12px;max-width:700px;margin:auto}'
-    'pre{white-space:pre-wrap;word-break:break-word;background:#1b1b1b;padding:8px;border-radius:8px;font-size:12px}'
-    'img{width:100%;border-radius:8px}'
-    'input,button{font-size:18px;padding:12px;border-radius:10px;border:0;width:100%;box-sizing:border-box;margin:6px 0}'
-    'button{background:#2563eb;color:#fff}a{color:#60a5fa}</style>'
-)
-
-
 # ------------------------------------------------------------
-# Việc chạy nền: mở trang đích, đợi đếm ngược, bấm nút, đọc mã
+# Tiến trình chạy nền: Mở trang đích, xử lý đếm ngược và lấy mã
 # ------------------------------------------------------------
 def run_job(job_id, domain, max_wait):
     job = JOBS[job_id]
@@ -66,7 +56,6 @@ def run_job(job_id, domain, max_wait):
                 page = context.new_page()
 
                 def pause(sec):
-                    # wait_for_timeout vẫn xử lý sự kiện của trình duyệt (khác time.sleep)
                     page.wait_for_timeout(int(sec * 1000))
 
                 def shot():
@@ -76,7 +65,6 @@ def run_job(job_id, domain, max_wait):
                         pass
 
                 def button_text():
-                    """Đọc chữ trên nút đỏ (đếm ngược, hướng dẫn, hoặc mã)."""
                     try:
                         return page.evaluate("""() => {
                             const re = /(Vui lòng chờ|Lấy mã sau|LẤY MÃ|Vui lòng click|Mã KM)/i;
@@ -126,7 +114,6 @@ def run_job(job_id, domain, max_wait):
                 code = None
 
                 def click_any_link():
-                    """Bấm một link bất kỳ (ưu tiên link nội bộ), rồi quay lại nếu bị chuyển trang."""
                     try:
                         links = page.evaluate("""() => Array.from(document.querySelectorAll('a[href]'))
                             .filter(a => a.offsetParent !== null)
@@ -148,7 +135,7 @@ def run_job(job_id, domain, max_wait):
                     except Exception as e:
                         log("Không bấm được link: " + str(e)[:100])
                     pause(4)
-                    for extra in context.pages[1:]:  # đóng tab quảng cáo
+                    for extra in context.pages[1:]:
                         try:
                             extra.close()
                         except Exception:
@@ -204,8 +191,7 @@ def run_job(job_id, domain, max_wait):
                         pause(2)
 
                 if not code:
-                    log("Hết thời gian (" + str(max_wait) + "s) mà chưa có mã. Link4m có thể đã đổi sang "
-                        "trang khác, hãy mở lại link4m để xem từ khóa mới")
+                    log("Hết thời gian (" + str(max_wait) + "s) mà chưa có mã.")
                 job["result"] = {"code": code, "last_button_text": last_state, "url": page.url}
                 shot()
             finally:
@@ -219,22 +205,8 @@ def run_job(job_id, domain, max_wait):
 
 
 # ------------------------------------------------------------
-# Các trang web
+# Các API Endpoints kết nối với Frontend Cyberpunk
 # ------------------------------------------------------------
-@app.route('/', methods=['GET'])
-def home():
-    return (
-        '<!doctype html><html><head><meta charset="utf-8">' + STYLE + '</head><body>'
-        '<h2>Lấy mã Link4m</h2>'
-        '<p>Nhập tên trang đích (ví dụ <b>slotsunda.com</b>) rồi bấm nút.</p>'
-        '<form action="/getcode" method="get">'
-        '<input name="domain" placeholder="slotsunda.com" autocapitalize="none" autocorrect="off" required>'
-        '<button type="submit">Bắt đầu lấy mã</button></form>'
-        '<p style="font-size:13px;color:#aaa">Chỉ lấy mã rồi thoát. Đừng đăng ký hay nạp tiền ở trang đích.</p>'
-        '</body></html>'
-    )
-
-
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "online"})
@@ -247,32 +219,48 @@ def getcode_endpoint():
     domain = (request.args.get('domain') or '').strip()
     domain = domain.replace('https://', '').replace('http://', '').split('/')[0]
     if not domain:
-        return jsonify({"error": "Thiếu tham số domain, ví dụ ?domain=zodii.co"}), 400
+        return jsonify({"error": "Thiếu tham số domain"}), 400
     try:
         max_wait = max(30, min(570, int(request.args.get('wait', 480))))
     except ValueError:
         max_wait = 480
 
     with JOB_LOCK:
-        for j in JOBS.values():
+        for j in list(JOBS.values()):
             if j["status"] == "running":
-                return redirect('/view?id=' + j["id"])  # đang có việc chạy, xem việc đó
+                # Trả về JSON để Frontend bắt được thay vì lỗi định dạng
+                return jsonify({"id": j["id"], "reused": True})
+        
         job_id = uuid.uuid4().hex[:8]
-        JOBS[job_id] = {"id": job_id, "status": "running", "log": [], "result": None,
-                        "shot": None, "t0": time.time(), "domain": domain}
+        JOBS[job_id] = {
+            "id": job_id, 
+            "status": "running", 
+            "log": [], 
+            "result": None,
+            "shot": None, 
+            "t0": time.time(), 
+            "domain": domain
+        }
         for old in list(JOBS.keys())[:-5]:
             del JOBS[old]
+            
     threading.Thread(target=run_job, args=(job_id, domain, max_wait), daemon=True).start()
-    return redirect('/view?id=' + job_id)
+    
+    # Trả về JSON chuẩn để code Javascript gọi fetch() đọc được
+    return jsonify({"id": job_id, "status": "running"})
 
 
 @app.route('/job', methods=['GET'])
 def job_endpoint():
     job = JOBS.get(request.args.get('id', ''))
     if not job:
-        return jsonify({"error": "Không tìm thấy việc này (máy có thể vừa khởi động lại)"}), 404
-    return jsonify({"status": job["status"], "elapsed": round(time.time() - job["t0"]),
-                    "log": job["log"], "result": job["result"]})
+        return jsonify({"error": "Không tìm thấy việc này"}), 404
+    return jsonify({
+        "status": job["status"], 
+        "elapsed": round(time.time() - job["t0"]),
+        "log": job["log"], 
+        "result": job["result"]
+    })
 
 
 @app.route('/shot', methods=['GET'])
@@ -283,40 +271,6 @@ def shot_endpoint():
     resp = Response(job["shot"], mimetype="image/jpeg")
     resp.headers['Cache-Control'] = 'no-store'
     return resp
-
-
-@app.route('/view', methods=['GET'])
-def view_endpoint():
-    job_id = request.args.get('id', '')
-    job = JOBS.get(job_id)
-    if not job:
-        return ("Không tìm thấy việc này (máy có thể vừa khởi động lại). "
-                "Hãy mở lại <a href='/'>trang chủ</a>."), 404
-    refresh = '<meta http-equiv="refresh" content="5">' if job["status"] == "running" else ''
-    log_text = html.escape("\n".join(job["log"]))
-    result_text = html.escape(json.dumps(job["result"], ensure_ascii=False, indent=1)) if job["result"] else "(chưa có)"
-    code_block = ''
-    if job["result"] and job["result"].get("code"):
-        c = html.escape(str(job["result"]["code"]))
-        code_block = ('<h1 style="color:#4ade80;font-size:44px;margin:8px 0">MÃ: ' + c + '</h1>'
-                      '<button onclick="navigator.clipboard.writeText(\'' + c + '\');this.innerText=\'Đã chép\'">'
-                      'Chép mã</button>')
-    return (
-        '<!doctype html><html><head><meta charset="utf-8">' + refresh + STYLE + '</head><body>'
-        '<h3>' + html.escape(job["domain"]) + ' — ' + job["status"] +
-        ' (' + str(round(time.time() - job["t0"])) + 's)</h3>'
-        + code_block +
-        '<img src="/shot?id=' + job_id + '&t=' + str(int(time.time())) + '" alt="(chưa có ảnh)">'
-        '<h4>Kết quả</h4><pre>' + result_text + '</pre>'
-        '<h4>Nhật ký</h4><pre>' + log_text + '</pre></body></html>'
-    )
-
-
-@app.route('/bypass', methods=['GET', 'POST', 'OPTIONS'])
-@app.route('/api/bypass', methods=['GET', 'POST', 'OPTIONS'])
-def old_bypass():
-    # Cách cũ (mở thẳng link4m) bị Cloudflare chặn nên đã bỏ.
-    return jsonify({"success": False, "error": "Đã bỏ. Hãy dùng /getcode?domain=TÊN_TRANG"}), 200
 
 
 if __name__ == '__main__':
