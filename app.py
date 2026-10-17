@@ -16,6 +16,8 @@ CORS(app)
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
+# Cấu hình chống phát hiện bot và tối ưu chạy trên Render Docker
 BROWSER_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -23,14 +25,13 @@ BROWSER_ARGS = [
     '--disable-gpu',
     '--disable-software-rasterizer',
     '--disable-blink-features=AutomationControlled',
+    '--disable-features=IsolateOrigins,site-per-process',
+    '--window-size=1280,800',
 ]
 
 JOBS = {}
 JOB_LOCK = threading.Lock()
 
-# ------------------------------------------------------------
-# Tiến trình chạy nền: Mở trang đích, xử lý đếm ngược và lấy mã
-# ------------------------------------------------------------
 def run_job(job_id, domain, max_wait):
     job = JOBS[job_id]
 
@@ -40,6 +41,7 @@ def run_job(job_id, domain, max_wait):
 
     try:
         with sync_playwright() as p:
+            # Khởi động trình duyệt với cấu hình tàng hình
             browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
             try:
                 context = browser.new_context(
@@ -47,12 +49,20 @@ def run_job(job_id, domain, max_wait):
                     viewport={"width": 1280, "height": 800},
                     locale="vi-VN",
                     timezone_id="Asia/Ho_Chi_Minh",
-                    extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"},
+                    extra_http_headers={
+                        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+                        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"'
+                    },
                 )
+                
+                # Ép thuộc tính ẩn danh để qua mặt bộ lọc chống bot của trang đích
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     window.chrome = window.chrome || { runtime: {} };
+                    Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
                 """)
+                
                 page = context.new_page()
 
                 def pause(sec):
@@ -60,14 +70,14 @@ def run_job(job_id, domain, max_wait):
 
                 def shot():
                     try:
-                        job["shot"] = page.screenshot(type="jpeg", quality=45)
+                        job["shot"] = page.screenshot(type="jpeg", quality=50)
                     except Exception:
                         pass
 
                 def button_text():
                     try:
                         return page.evaluate("""() => {
-                            const re = /(Vui lòng chờ|Lấy mã sau|LẤY MÃ|Vui lòng click|Mã KM)/i;
+                            const re = /(Vui lòng chờ|Lấy mã sau|LẤY MÃ|lấy mã|Vui lòng click|Mã KM)/i;
                             let best = null;
                             for (const el of document.querySelectorAll('a,button,div,span,p')) {
                                 if (el.children.length > 3) continue;
@@ -85,11 +95,19 @@ def run_job(job_id, domain, max_wait):
                     except Exception:
                         pass
                     pause(1.5)
-                    for selector in [
-                        'text=LẤY MÃ', 'a:has-text("LẤY MÃ")', 'button:has-text("LẤY MÃ")',
-                        'img[alt*="LẤY MÃ" i]', '[id*="l4m" i]', '[class*="l4m" i]',
-                        '[onclick*="l4m" i]',
-                    ]:
+                    
+                    # Danh sách bộ chọn linh hoạt, không phân biệt hoa thường để bắt trọn nút bấm
+                    selectors = [
+                        'text=/lấy mã/i',
+                        'a:has-text("lấy mã")',
+                        'button:has-text("lấy mã")',
+                        'div:has-text("LẤY MÃ")',
+                        'img[alt*="lấy mã" i]',
+                        '[id*="l4m" i]',
+                        '[class*="l4m" i]'
+                    ]
+                    
+                    for selector in selectors:
                         try:
                             el = page.locator(selector).first
                             if el.count() > 0 and el.is_visible():
@@ -100,12 +118,13 @@ def run_job(job_id, domain, max_wait):
                             continue
                     return None
 
-                log("Mở trang " + domain + " (nguồn đến: Google)")
+                log("Mở trang đích: " + domain + " (với Referer Google)")
                 page.goto("https://" + domain, timeout=30000,
                           wait_until="domcontentloaded",
                           referer="https://www.google.com/")
                 pause(4)
                 shot()
+                
                 orig_url = page.url
                 deadline = time.time() + max_wait
                 last_state = None
@@ -131,7 +150,7 @@ def run_job(job_id, domain, max_wait):
                             log("Đã bấm link nội bộ: '" + pick["t"] + "'")
                         else:
                             page.locator('a[href]:visible').nth(2).click(timeout=4000, no_wait_after=True)
-                            log("Không có link nội bộ, đã bấm link thứ 3")
+                            log("Đã bấm link dự phòng")
                     except Exception as e:
                         log("Không bấm được link: " + str(e)[:100])
                     pause(4)
@@ -141,7 +160,6 @@ def run_job(job_id, domain, max_wait):
                         except Exception:
                             pass
                     if page.url.split('#')[0] != orig_url.split('#')[0]:
-                        log("Trang đã chuyển sang " + page.url + ", quay lại")
                         try:
                             page.go_back(timeout=8000)
                         except Exception:
@@ -154,34 +172,37 @@ def run_job(job_id, domain, max_wait):
                 while time.time() < deadline:
                     txt = button_text() or ""
                     if txt != last_state:
-                        log("Nút: " + (txt if txt else "(không thấy nút)"))
+                        log("Trạng thái nút: " + (txt if txt else "(đang đếm ngược)"))
                         last_state = txt
                         shot()
+                        
                     m = re.search(r'Mã KM:\s*([A-Za-z0-9]+)', txt)
                     if m:
                         code = m.group(1)
-                        log("ĐÃ CÓ MÃ: " + code)
+                        log("ĐÃ TÌM THẤY MÃ: " + code)
                         shot()
                         break
+                        
                     low = txt.lower()
-                    if "vui lòng chờ" in low or "lấy mã sau" in low:
+                    if "vui lòng chờ" in low or "lấy mã sau" in low or not txt:
+                        # Giả lập tương tác chuột ngẫu nhiên để chống đóng băng bộ đếm ngược
                         try:
-                            page.mouse.move(random.randint(100, 900), random.randint(100, 600))
-                            page.mouse.wheel(0, random.choice([-120, 120]))
+                            page.mouse.move(random.randint(150, 850), random.randint(150, 550))
+                            page.mouse.wheel(0, random.choice([-100, 100]))
                         except Exception:
                             pass
-                        pause(2)
-                        if int(time.time()) % 10 < 2:
+                        pause(2.5)
+                        if int(time.time()) % 12 < 2:
                             shot()
                     elif "click vào link" in low:
                         if link_attempts < 3 and time.time() - last_link_time > 20:
                             link_attempts += 1
                             last_link_time = time.time()
                             click_any_link()
-                        log("Lướt xuống và bấm nút: " + str(click_lay_ma()))
+                        log("Cuộn trang và bấm: " + str(click_lay_ma()))
                         pause(3)
                     elif "lấy mã" in low:
-                        log("Bấm nút LẤY MÃ: " + str(click_lay_ma()))
+                        log("Bấm nút lấy mã: " + str(click_lay_ma()))
                         pause(3)
                     else:
                         try:
@@ -191,22 +212,21 @@ def run_job(job_id, domain, max_wait):
                         pause(2)
 
                 if not code:
-                    log("Hết thời gian (" + str(max_wait) + "s) mà chưa có mã.")
+                    log("Hết thời gian (" + str(max_wait) + "s) mà chưa lấy được mã.")
                 job["result"] = {"code": code, "last_button_text": last_state, "url": page.url}
                 shot()
             finally:
                 browser.close()
     except Exception as e:
         job["result"] = {"exception": str(e)[:500]}
-        log("LỖI: " + str(e)[:200])
+        log("LỖI HỆ THỐNG: " + str(e)[:200])
     finally:
         job["status"] = "done"
-        log("Kết thúc")
+        log("Hoàn thành tiến trình")
 
 
-# ------------------------------------------------------------
-# Các API Endpoints kết nối với Frontend Cyberpunk
-# ------------------------------------------------------------
+# --- API ENDPOINTS CHO FRONTEND CYBERPUNK ---
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "online"})
@@ -228,7 +248,6 @@ def getcode_endpoint():
     with JOB_LOCK:
         for j in list(JOBS.values()):
             if j["status"] == "running":
-                # Trả về JSON để Frontend bắt được thay vì lỗi định dạng
                 return jsonify({"id": j["id"], "reused": True})
         
         job_id = uuid.uuid4().hex[:8]
@@ -245,8 +264,6 @@ def getcode_endpoint():
             del JOBS[old]
             
     threading.Thread(target=run_job, args=(job_id, domain, max_wait), daemon=True).start()
-    
-    # Trả về JSON chuẩn để code Javascript gọi fetch() đọc được
     return jsonify({"id": job_id, "status": "running"})
 
 
@@ -254,7 +271,7 @@ def getcode_endpoint():
 def job_endpoint():
     job = JOBS.get(request.args.get('id', ''))
     if not job:
-        return jsonify({"error": "Không tìm thấy việc này"}), 404
+        return jsonify({"error": "Không tìm thấy tiến trình"}), 404
     return jsonify({
         "status": job["status"], 
         "elapsed": round(time.time() - job["t0"]),
