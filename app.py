@@ -17,7 +17,6 @@ CORS(app)
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
-# Cấu hình chống phát hiện bot và tối ưu chạy trên Render Docker
 BROWSER_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
@@ -41,7 +40,6 @@ def run_job(job_id, domain, max_wait):
 
     try:
         with sync_playwright() as p:
-            # Khởi động trình duyệt với cấu hình tàng hình
             browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
             try:
                 context = browser.new_context(
@@ -55,7 +53,6 @@ def run_job(job_id, domain, max_wait):
                     },
                 )
                 
-                # Ép thuộc tính ẩn danh để qua mặt bộ lọc chống bot của trang đích
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     window.chrome = window.chrome || { runtime: {} };
@@ -91,31 +88,24 @@ def run_job(job_id, domain, max_wait):
 
                 def click_lay_ma():
                     try:
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    except Exception:
-                        pass
-                    pause(1.5)
-                    
-                    # Danh sách bộ chọn linh hoạt, không phân biệt hoa thường để bắt trọn nút bấm
-                    selectors = [
-                        'text=/lấy mã/i',
-                        'a:has-text("lấy mã")',
-                        'button:has-text("lấy mã")',
-                        'div:has-text("LẤY MÃ")',
-                        'img[alt*="lấy mã" i]',
-                        '[id*="l4m" i]',
-                        '[class*="l4m" i]'
-                    ]
-                    
-                    for selector in selectors:
-                        try:
-                            el = page.locator(selector).first
-                            if el.count() > 0 and el.is_visible():
-                                el.scroll_into_view_if_needed(timeout=3000)
-                                el.click(timeout=3000)
-                                return selector
-                        except Exception:
-                            continue
+                        # Sử dụng JavaScript click trực tiếp để vượt qua các lớp phủ hoặc giới hạn selector
+                        clicked = page.evaluate("""() => {
+                            const elements = Array.from(document.querySelectorAll('a, button, div, span, p'));
+                            for (const el of elements) {
+                                const t = (el.innerText || '').trim().toLowerCase();
+                                if (t.includes('lấy mã') && el.offsetParent !== null) {
+                                    el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                                    el.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }""")
+                        if clicked:
+                            pause(2)
+                            return "JS_Click_Success"
+                    except Exception as e:
+                        log("Lỗi click JS: " + str(e)[:50])
                     return None
 
                 log("Mở trang đích: " + domain + " (với Referer Google)")
@@ -185,7 +175,6 @@ def run_job(job_id, domain, max_wait):
                         
                     low = txt.lower()
                     if "vui lòng chờ" in low or "lấy mã sau" in low or not txt:
-                        # Giả lập tương tác chuột ngẫu nhiên để chống đóng băng bộ đếm ngược
                         try:
                             page.mouse.move(random.randint(150, 850), random.randint(150, 550))
                             page.mouse.wheel(0, random.choice([-100, 100]))
@@ -224,8 +213,6 @@ def run_job(job_id, domain, max_wait):
         job["status"] = "done"
         log("Hoàn thành tiến trình")
 
-
-# --- API ENDPOINTS CHO FRONTEND CYBERPUNK ---
 
 @app.route('/health', methods=['GET'])
 def health():
