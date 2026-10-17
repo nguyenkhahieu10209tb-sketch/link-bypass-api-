@@ -53,7 +53,7 @@ def run_job(job_id, domain, max_wait):
                     },
                 )
                 
-                # Che giấu thuộc tính webdriver để tránh anti-bot làm đứng hình đếm ngược
+                # Vô hiệu hóa cờ kiểm soát tự động hóa của trình duyệt
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     window.chrome = window.chrome || { runtime: {} };
@@ -77,7 +77,7 @@ def run_job(job_id, domain, max_wait):
                     except Exception:
                         pass
 
-                # Giả lập cuộn trang nhẹ nhàng như người đọc văn bản thật
+                # Giả lập thao tác lướt đọc văn bản tự nhiên để kích hoạt các script đếm giây ẩn
                 def human_reading_scroll():
                     try:
                         page.evaluate("""() => {
@@ -107,15 +107,18 @@ def run_job(job_id, domain, max_wait):
 
                 def click_lay_ma():
                     try:
-                        # Click trực tiếp bằng JS, bỏ qua iframe quảng cáo và bẫy overlay
+                        # Lọc kích thước thật để né các nút giả mạo, banner rác
                         clicked = page.evaluate("""() => {
                             const elements = Array.from(document.querySelectorAll('a, button, div, span, p'));
                             for (const el of elements) {
                                 const t = (el.innerText || '').trim().toLowerCase();
                                 if (t.includes('lấy mã') && el.offsetParent !== null) {
-                                    el.scrollIntoView({behavior: 'smooth', block: 'center'});
-                                    el.click();
-                                    return true;
+                                    const rect = el.getBoundingClientRect();
+                                    if (rect.width > 25 && rect.height > 12) {
+                                        el.scrollIntoView({behavior: 'smooth', block: 'center'});
+                                        el.click();
+                                        return true;
+                                    }
                                 }
                             }
                             return false;
@@ -127,12 +130,11 @@ def run_job(job_id, domain, max_wait):
                         log("Lỗi click JS: " + str(e)[:50])
                     return None
 
-                # Click ngẫu nhiên 1 link trong menu (Bước 4/5)
                 def click_random_menu_link():
                     try:
                         clicked = page.evaluate("""() => {
                             const links = Array.from(document.querySelectorAll('a[href]'));
-                            const keywords = ['đăng ký', 'đăng nhập', 'nạp tiền', 'rút tiền', 'tải app', 'khuyến mãi', 'giới thiệu', 'chính sách', 'quyền riêng tư'];
+                            const keywords = ['giới thiệu', 'chính sách', 'quyền riêng tư', 'điều khoản', 'đăng ký', 'đăng nhập', 'nạp tiền', 'rút tiền', 'tải app', 'khuyến mãi'];
                             for (const kw of keywords) {
                                 for (const a of links) {
                                     if (a.offsetParent !== null && (a.innerText || '').toLowerCase().includes(kw)) {
@@ -168,7 +170,8 @@ def run_job(job_id, domain, max_wait):
                 
                 deadline = time.time() + max_wait
                 last_state = None
-                step_phase = "PRE_CHECK" # Chuỗi trạng thái: PRE_CHECK -> SCROLL_TO_BOTTOM_1 -> WAIT_TIMER_1 -> CHECK_NEXT_ACTION -> SCROLL_TO_BOTTOM_2 -> WAIT_TIMER_2 -> DONE
+                step_phase = "PRE_CHECK"
+                timer_start_v2 = 0
                 code = None
 
                 while time.time() < deadline:
@@ -178,7 +181,7 @@ def run_job(job_id, domain, max_wait):
                         last_state = txt
                         shot()
                         
-                    # 1. Bắt mã đích khi xuất hiện
+                    # Quét mã đích bất cứ lúc nào xuất hiện
                     m = re.search(r'Mã KM:\s*([A-Za-z0-9]+)', txt, re.IGNORECASE)
                     if m:
                         code = m.group(1)
@@ -188,12 +191,12 @@ def run_job(job_id, domain, max_wait):
                         
                     low = txt.lower()
 
-                    # Cửa ải 0: Kiểm tra xem trang chủ có nút hay không, nếu không có thì click mở bài viết bất kỳ
+                    # Cửa ải 0: Kiểm tra sơ bộ trang chủ
                     if step_phase == "PRE_CHECK":
                         if "lấy mã" in low or "vui lòng chờ" in low:
                             step_phase = "SCROLL_TO_BOTTOM_1"
                         else:
-                            log("Không thấy nút ở trang chủ, đang tìm bài viết/chuyên mục để vào trang bài...")
+                            log("Không thấy nút ở trang chủ, đang tìm bài viết/chuyên mục...")
                             click_random_menu_link()
                             step_phase = "SCROLL_TO_BOTTOM_1"
                         pause(2)
@@ -213,14 +216,14 @@ def run_job(job_id, domain, max_wait):
                         sec_match = re.search(r'(\d+)\s*(?:s|giây)', txt, re.IGNORECASE)
                         if sec_match:
                             wait_secs = int(sec_match.group(1))
-                            log(f"Đang đợi đếm ngược vòng 1 ({wait_secs}s) & lướt đọc...")
+                            log(f"Đang đợi đếm ngược vòng 1 ({wait_secs}s)...")
                             for _ in range(max(1, wait_secs // 3)):
                                 human_reading_scroll()
                                 pause(3)
                         else:
                             step_phase = "CHECK_NEXT_ACTION"
 
-                    # Bước 4: Kiểm tra xem có bắt bấm link bất kỳ không hay nhả mã luôn
+                    # Bước 4: Kiểm tra xem có bắt bấm link bất kỳ không
                     elif step_phase == "CHECK_NEXT_ACTION":
                         if "click vào link" in low or "vui lòng click" in low:
                             log("Bước 4: Bắt buộc ấn vô trang bất kỳ theo yêu cầu...")
@@ -238,9 +241,10 @@ def run_job(job_id, domain, max_wait):
                         log("Ấn nút lấy mã lần 2...")
                         click_lay_ma()
                         step_phase = "WAIT_TIMER_2"
+                        timer_start_v2 = time.time() # Đánh dấu mốc bắt đầu vòng 2 chống treo
                         pause(3)
 
-                    # Đợi đếm ngược đợt cuối
+                    # Đợi đếm ngược đợt cuối (Có cơ chế chống treo cứng vòng 2)
                     elif step_phase == "WAIT_TIMER_2":
                         sec_match = re.search(r'(\d+)\s*(?:s|giây)', txt, re.IGNORECASE)
                         if sec_match:
@@ -250,12 +254,29 @@ def run_job(job_id, domain, max_wait):
                                 human_reading_scroll()
                                 pause(3)
                         else:
-                            human_reading_scroll()
-                            try:
+                            elapsed_v2 = time.time() - timer_start_v2
+                            if elapsed_v2 < 65:
+                                human_reading_scroll()
+                                pause(3)
+                            else:
+                                log("Hết thời gian chờ vòng 2, tiến hành quét toàn trang lấy mã...")
                                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                            except Exception:
-                                pass
-                            pause(2)
+                                pause(2)
+                                # Quét sâu toàn bộ body text để tìm mã
+                                code_found = page.evaluate("""() => {
+                                    const bodyText = document.body.innerText;
+                                    const match = bodyText.match(/Mã KM[:\\s]*([A-Za-z0-9]+)/i);
+                                    return match ? match[1] : null;
+                                }""")
+                                if code_found:
+                                    code = code_found
+                                    log("ĐÃ TÌM THẤY MÃ (QUÉT TOÀN TRANG): " + code)
+                                    shot()
+                                    break
+                                else:
+                                    log("Đang ép làm mới cuộn trang để kích hoạt hiển thị mã...")
+                                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                                    pause(5)
                     else:
                         human_reading_scroll()
                         pause(2)
