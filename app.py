@@ -6,7 +6,7 @@ import uuid
 import random
 import time
 import threading
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify, redirect, Response
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
@@ -14,112 +14,33 @@ from playwright.sync_api import sync_playwright
 app = Flask(__name__)
 CORS(app)
 
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+BROWSER_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-blink-features=AutomationControlled',
+]
 
-@app.after_request
-def add_cors_headers(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
-    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
-    return response
-
-
-def bypass_with_playwright(target_url):
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-software-rasterizer',
-                    '--disable-blink-features=AutomationControlled'
-                ]
-            )
-            try:
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                    viewport={"width": 1280, "height": 800},
-                    locale="vi-VN",
-                    timezone_id="Asia/Ho_Chi_Minh",
-                    extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"}
-                )
-                # Giấu dấu hiệu "trình duyệt tự động" mà các trang hay kiểm tra
-                context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    window.chrome = window.chrome || { runtime: {} };
-                    Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                """)
-                page = context.new_page()
-
-                page.goto(target_url, timeout=35000, wait_until="domcontentloaded")
-
-                start_time = time.time()
-                final_url = None
-
-                while time.time() - start_time < 25:
-                    current_url = page.url
-
-                    if (
-                        current_url != target_url
-                        and "challenges.cloudflare.com" not in current_url
-                        and "link4m" not in current_url
-                    ):
-                        final_url = current_url
-                        break
-
-                    try:
-                        for selector in [
-                            'button:has-text("Lấy mã")',
-                            'button:has-text("Tiếp tục")',
-                            '#continue-btn',
-                            '.get-link',
-                            'a:has-text("Lấy mã")'
-                        ]:
-                            btn = page.locator(selector).first
-                            if btn.is_visible():
-                                btn.click(timeout=1000)
-                                time.sleep(2)
-                    except Exception:
-                        pass
-
-                    time.sleep(1)
-
-                if not final_url:
-                    final_url = page.url
-
-                # Chụp lại trang trình duyệt đang thấy, để biết nó bị kẹt ở đâu
-                debug = {"final_url": page.url}
-                try:
-                    debug["title"] = page.title()
-                    debug["text"] = page.inner_text("body")[:400]
-                except Exception as de:
-                    debug["debug_error"] = str(de)
-            finally:
-                # Luôn đóng trình duyệt để không tốn RAM (gói free chỉ có 512MB)
-                browser.close()
-
-            if "challenges.cloudflare.com" in final_url or final_url == target_url:
-                return None, debug
-            return final_url, debug
-
-    except Exception as e:
-        print(f"Playwright Error: {e}")
-        return None, {"exception": str(e)}
-
-
-# ============================================================
-# LẤY MÃ KIỂU "GIAO VIỆC RỒI XEM TIẾN ĐỘ"
-# Vì thời gian chờ của link4m có thể 45 / 60 / 120 giây, một request không chờ nổi.
-# /getcode?domain=...  -> bắt đầu chạy nền, chuyển sang trang /view để xem trực tiếp
-# /view?id=...         -> trang tự làm mới: ảnh chụp trang + nhật ký + kết quả
-# ============================================================
 JOBS = {}
 JOB_LOCK = threading.Lock()
 
+STYLE = (
+    '<meta name="viewport" content="width=device-width,initial-scale=1">'
+    '<style>body{background:#111;color:#eee;font-family:sans-serif;padding:12px;max-width:700px;margin:auto}'
+    'pre{white-space:pre-wrap;word-break:break-word;background:#1b1b1b;padding:8px;border-radius:8px;font-size:12px}'
+    'img{width:100%;border-radius:8px}'
+    'input,button{font-size:18px;padding:12px;border-radius:10px;border:0;width:100%;box-sizing:border-box;margin:6px 0}'
+    'button{background:#2563eb;color:#fff}a{color:#60a5fa}</style>'
+)
 
+
+# ------------------------------------------------------------
+# Việc chạy nền: mở trang đích, đợi đếm ngược, bấm nút, đọc mã
+# ------------------------------------------------------------
 def run_job(job_id, domain, max_wait):
     job = JOBS[job_id]
 
@@ -129,24 +50,14 @@ def run_job(job_id, domain, max_wait):
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-software-rasterizer',
-                    '--disable-blink-features=AutomationControlled'
-                ]
-            )
+            browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
             try:
                 context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    user_agent=USER_AGENT,
                     viewport={"width": 1280, "height": 800},
                     locale="vi-VN",
                     timezone_id="Asia/Ho_Chi_Minh",
-                    extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"}
+                    extra_http_headers={"Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"},
                 )
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -164,55 +75,21 @@ def run_job(job_id, domain, max_wait):
                     except Exception:
                         pass
 
-                def all_lines():
-                    out = []
-                    for fr in page.frames:
-                        try:
-                            t = fr.inner_text("body", timeout=1500)
-                        except Exception:
-                            continue
-                        out.extend(l.strip() for l in t.splitlines() if l.strip())
-                    return out
-
-                def new_lines(baseline):
-                    return [l[:100] for l in all_lines() if l not in baseline][:8]
-
-                def code_like(lines):
-                    return [
-                        l for l in lines
-                        if 5 <= len(l) <= 20 and re.fullmatch(r'[A-Za-z0-9_\-]+', l)
-                        and any(c.isdigit() for c in l) and any(c.isalpha() for c in l)
-                    ][:5]
-
-                def wait_countdown(baseline, label):
-                    """Chờ linh hoạt: lướt như người đọc, ghi lại chữ mới, dừng khi có dấu hiệu xong."""
-                    start = time.time()
-                    saw_new = False
-                    last = None
-                    direction = 1
-                    while time.time() - start < max_wait:
-                        try:
-                            page.mouse.move(random.randint(100, 900), random.randint(100, 600))
-                            page.mouse.wheel(0, 350 * direction)
-                        except Exception:
-                            pass
-                        direction = -direction
-                        pause(3)
-                        shot()
-                        nl = new_lines(baseline)
-                        if nl != last:
-                            log(label + " | chữ mới: " + (" / ".join(nl) if nl else "(không còn)"))
-                            last = nl
-                        if code_like(nl):
-                            log("Thấy dòng giống mã: " + str(code_like(nl)))
-                            return "code"
-                        if nl:
-                            saw_new = True
-                        elif saw_new:
-                            log(label + " | chữ đếm ngược đã biến mất, coi như xong")
-                            return "gone"
-                    log(label + " | hết thời gian chờ tối đa (" + str(max_wait) + "s)")
-                    return "timeout"
+                def button_text():
+                    """Đọc chữ trên nút đỏ (đếm ngược, hướng dẫn, hoặc mã)."""
+                    try:
+                        return page.evaluate("""() => {
+                            const re = /(Vui lòng chờ|Lấy mã sau|LẤY MÃ|Vui lòng click|Mã KM)/i;
+                            let best = null;
+                            for (const el of document.querySelectorAll('a,button,div,span,p')) {
+                                if (el.children.length > 3) continue;
+                                const t = (el.innerText || '').trim();
+                                if (t && t.length < 160 && re.test(t) && (!best || t.length < best.length)) best = t;
+                            }
+                            return best;
+                        }""")
+                    except Exception:
+                        return None
 
                 def click_lay_ma():
                     try:
@@ -223,7 +100,7 @@ def run_job(job_id, domain, max_wait):
                     for selector in [
                         'text=LẤY MÃ', 'a:has-text("LẤY MÃ")', 'button:has-text("LẤY MÃ")',
                         'img[alt*="LẤY MÃ" i]', '[id*="l4m" i]', '[class*="l4m" i]',
-                        '[onclick*="l4m" i]'
+                        '[onclick*="l4m" i]',
                     ]:
                         try:
                             el = page.locator(selector).first
@@ -248,24 +125,8 @@ def run_job(job_id, domain, max_wait):
                 last_link_time = 0
                 code = None
 
-                def button_text():
-                    """Đọc chữ trên nút đỏ của link4m (đếm ngược, hướng dẫn, hoặc mã)."""
-                    try:
-                        return page.evaluate("""() => {
-                            const re = /(Vui lòng chờ|Lấy mã sau|LẤY MÃ|Vui lòng click|Mã KM)/i;
-                            let best = null;
-                            for (const el of document.querySelectorAll('a,button,div,span,p')) {
-                                if (el.children.length > 3) continue;
-                                const t = (el.innerText || '').trim();
-                                if (t && t.length < 160 && re.test(t) && (!best || t.length < best.length)) best = t;
-                            }
-                            return best;
-                        }""")
-                    except Exception:
-                        return None
-
                 def click_any_link():
-                    """Bấm một link bất kỳ của trang (ưu tiên link nội bộ), rồi quay lại nếu bị chuyển trang."""
+                    """Bấm một link bất kỳ (ưu tiên link nội bộ), rồi quay lại nếu bị chuyển trang."""
                     try:
                         links = page.evaluate("""() => Array.from(document.querySelectorAll('a[href]'))
                             .filter(a => a.offsetParent !== null)
@@ -287,8 +148,7 @@ def run_job(job_id, domain, max_wait):
                     except Exception as e:
                         log("Không bấm được link: " + str(e)[:100])
                     pause(4)
-                    # đóng tab quảng cáo nếu có
-                    for extra in context.pages[1:]:
+                    for extra in context.pages[1:]:  # đóng tab quảng cáo
                         try:
                             extra.close()
                         except Exception:
@@ -318,7 +178,6 @@ def run_job(job_id, domain, max_wait):
                         break
                     low = txt.lower()
                     if "vui lòng chờ" in low or "lấy mã sau" in low:
-                        # đang đếm ngược: lướt nhẹ như người đang đọc
                         try:
                             page.mouse.move(random.randint(100, 900), random.randint(100, 600))
                             page.mouse.wheel(0, random.choice([-120, 120]))
@@ -345,7 +204,8 @@ def run_job(job_id, domain, max_wait):
                         pause(2)
 
                 if not code:
-                    log("Hết thời gian tối đa (" + str(max_wait) + "s) mà chưa có mã. Link4m sắp/đã hết phiên 600s và có thể đã đổi sang trang khác, hãy mở lại link4m để xem từ khóa mới")
+                    log("Hết thời gian (" + str(max_wait) + "s) mà chưa có mã. Link4m có thể đã đổi sang "
+                        "trang khác, hãy mở lại link4m để xem từ khóa mới")
                 job["result"] = {"code": code, "last_button_text": last_state, "url": page.url}
                 shot()
             finally:
@@ -356,6 +216,28 @@ def run_job(job_id, domain, max_wait):
     finally:
         job["status"] = "done"
         log("Kết thúc")
+
+
+# ------------------------------------------------------------
+# Các trang web
+# ------------------------------------------------------------
+@app.route('/', methods=['GET'])
+def home():
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">' + STYLE + '</head><body>'
+        '<h2>Lấy mã Link4m</h2>'
+        '<p>Nhập tên trang đích (ví dụ <b>slotsunda.com</b>) rồi bấm nút.</p>'
+        '<form action="/getcode" method="get">'
+        '<input name="domain" placeholder="slotsunda.com" autocapitalize="none" autocorrect="off" required>'
+        '<button type="submit">Bắt đầu lấy mã</button></form>'
+        '<p style="font-size:13px;color:#aaa">Chỉ lấy mã rồi thoát. Đừng đăng ký hay nạp tiền ở trang đích.</p>'
+        '</body></html>'
+    )
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "online"})
 
 
 @app.route('/getcode', methods=['GET', 'OPTIONS'])
@@ -408,66 +290,34 @@ def view_endpoint():
     job_id = request.args.get('id', '')
     job = JOBS.get(job_id)
     if not job:
-        return "Không tìm thấy việc này (máy có thể vừa khởi động lại). Hãy mở lại /getcode?domain=...", 404
+        return ("Không tìm thấy việc này (máy có thể vừa khởi động lại). "
+                "Hãy mở lại <a href='/'>trang chủ</a>."), 404
     refresh = '<meta http-equiv="refresh" content="5">' if job["status"] == "running" else ''
     log_text = html.escape("\n".join(job["log"]))
     result_text = html.escape(json.dumps(job["result"], ensure_ascii=False, indent=1)) if job["result"] else "(chưa có)"
-    page_html = (
-        '<!doctype html><html><head><meta charset="utf-8">' + refresh +
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<style>body{background:#111;color:#eee;font-family:sans-serif;padding:10px}'
-        'pre{white-space:pre-wrap;word-break:break-word;background:#1b1b1b;padding:8px;border-radius:8px;font-size:12px}'
-        'img{width:100%;border-radius:8px}</style></head><body>'
-        '<h3>' + html.escape(job["domain"]) + ' — ' + job["status"] + ' (' + str(round(time.time() - job["t0"])) + 's)</h3>'
-        + ('<h2 style="color:#4ade80">MÃ: ' + html.escape(str(job["result"].get("code"))) + '</h2>'
-           if job["result"] and job["result"].get("code") else '') +
+    code_block = ''
+    if job["result"] and job["result"].get("code"):
+        c = html.escape(str(job["result"]["code"]))
+        code_block = ('<h1 style="color:#4ade80;font-size:44px;margin:8px 0">MÃ: ' + c + '</h1>'
+                      '<button onclick="navigator.clipboard.writeText(\'' + c + '\');this.innerText=\'Đã chép\'">'
+                      'Chép mã</button>')
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">' + refresh + STYLE + '</head><body>'
+        '<h3>' + html.escape(job["domain"]) + ' — ' + job["status"] +
+        ' (' + str(round(time.time() - job["t0"])) + 's)</h3>'
+        + code_block +
         '<img src="/shot?id=' + job_id + '&t=' + str(int(time.time())) + '" alt="(chưa có ảnh)">'
         '<h4>Kết quả</h4><pre>' + result_text + '</pre>'
         '<h4>Nhật ký</h4><pre>' + log_text + '</pre></body></html>'
     )
-    return page_html
 
 
-@app.route('/', methods=['GET', 'POST', 'OPTIONS'])
 @app.route('/bypass', methods=['GET', 'POST', 'OPTIONS'])
 @app.route('/api/bypass', methods=['GET', 'POST', 'OPTIONS'])
-def bypass_endpoint():
-    if request.method == 'OPTIONS':
-        return '', 204
-
-    if request.method == 'POST':
-        data = request.get_json(silent=True) or {}
-        url = data.get('url') or request.form.get('url')
-    else:
-        url = request.args.get('url')
-
-    if not url:
-        return jsonify({
-            "status": "online",
-            "message": "Galaxy Bypass Playwright API is ready."
-        }), 200
-
-    url = unquote(str(url)).strip()
-
-    bypassed, debug = bypass_with_playwright(url)
-
-    if not bypassed:
-        return jsonify({
-            "success": False,
-            "original_url": url,
-            "error": "Không thể xử lý liên kết hoặc hết thời gian chờ.",
-            "debug": debug
-        }), 200
-
-    return jsonify({
-        "success": True,
-        "original_url": url,
-        "bypassed_url": bypassed,
-        "destination": bypassed,
-        "method": "playwright_browser"
-    })
+def old_bypass():
+    # Cách cũ (mở thẳng link4m) bị Cloudflare chặn nên đã bỏ.
+    return jsonify({"success": False, "error": "Đã bỏ. Hãy dùng /getcode?domain=TÊN_TRANG"}), 200
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
