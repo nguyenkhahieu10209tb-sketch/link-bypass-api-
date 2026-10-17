@@ -53,7 +53,7 @@ def run_job(job_id, domain, max_wait):
                     },
                 )
                 
-                # Vô hiệu hóa cờ kiểm soát tự động hóa của trình duyệt
+                # Che giấu thuộc tính webdriver tránh anti-bot
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     window.chrome = window.chrome || { runtime: {} };
@@ -77,7 +77,6 @@ def run_job(job_id, domain, max_wait):
                     except Exception:
                         pass
 
-                # Giả lập thao tác lướt đọc văn bản tự nhiên để kích hoạt các script đếm giây ẩn
                 def human_reading_scroll():
                     try:
                         page.evaluate("""() => {
@@ -107,7 +106,6 @@ def run_job(job_id, domain, max_wait):
 
                 def click_lay_ma():
                     try:
-                        # Lọc kích thước thật để né các nút giả mạo, banner rác
                         clicked = page.evaluate("""() => {
                             const elements = Array.from(document.querySelectorAll('a, button, div, span, p'));
                             for (const el of elements) {
@@ -154,7 +152,7 @@ def run_job(job_id, domain, max_wait):
                             return null;
                         }""")
                         if clicked:
-                            log(f"Đã bấm vào trang bất kỳ: '{clicked}'")
+                            log(f"Đã bấm vào trang bất kỳ/menu: '{clicked}'")
                             pause(4)
                             return True
                     except Exception as e:
@@ -221,17 +219,15 @@ def run_job(job_id, domain, max_wait):
                                 human_reading_scroll()
                                 pause(3)
                         else:
+                            # Hết giờ vòng 1, bắt buộc sang Bước 4 (Click link menu)
                             step_phase = "CHECK_NEXT_ACTION"
 
-                    # Bước 4: Kiểm tra xem có bắt bấm link bất kỳ không
+                    # Bước 4: Bắt buộc click link menu/trang phụ (Khóa cứng không cho bỏ qua)
                     elif step_phase == "CHECK_NEXT_ACTION":
-                        if "click vào link" in low or "vui lòng click" in low:
-                            log("Bước 4: Bắt buộc ấn vô trang bất kỳ theo yêu cầu...")
-                            click_random_menu_link()
-                            step_phase = "SCROLL_TO_BOTTOM_2"
-                        else:
-                            step_phase = "SCROLL_TO_BOTTOM_2"
-                        pause(2)
+                        log("Bước 4: Hết giờ vòng 1, tiến hành click vào link menu/trang phụ...")
+                        click_random_menu_link()
+                        pause(3)
+                        step_phase = "SCROLL_TO_BOTTOM_2"
 
                     # Bước 5: Lướt xuống cuối ấn LẤY MÃ lần 2
                     elif step_phase == "SCROLL_TO_BOTTOM_2":
@@ -241,7 +237,7 @@ def run_job(job_id, domain, max_wait):
                         log("Ấn nút lấy mã lần 2...")
                         click_lay_ma()
                         step_phase = "WAIT_TIMER_2"
-                        timer_start_v2 = time.time() # Đánh dấu mốc bắt đầu vòng 2 chống treo
+                        timer_start_v2 = time.time()
                         pause(3)
 
                     # Đợi đếm ngược đợt cuối (Có cơ chế chống treo cứng vòng 2)
@@ -262,7 +258,6 @@ def run_job(job_id, domain, max_wait):
                                 log("Hết thời gian chờ vòng 2, tiến hành quét toàn trang lấy mã...")
                                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                                 pause(2)
-                                # Quét sâu toàn bộ body text để tìm mã
                                 code_found = page.evaluate("""() => {
                                     const bodyText = document.body.innerText;
                                     const match = bodyText.match(/Mã KM[:\\s]*([A-Za-z0-9]+)/i);
