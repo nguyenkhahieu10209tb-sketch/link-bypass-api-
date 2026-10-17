@@ -162,27 +162,53 @@ def get_code_from_domain(domain):
                         continue
                 steps.append("Nút LẤY MÃ bấm bằng: " + str(clicked))
 
-                time.sleep(20)  # chờ đếm ngược
+                def snapshot(label):
+                    """Chụp lại chữ trên trang để xem mã (nếu có) hiện ở đâu."""
+                    try:
+                        text = page.inner_text("body")
+                    except Exception as se:
+                        return {"label": label, "error": str(se)[:80]}
+                    lines = [l.strip() for l in text.splitlines() if l.strip()]
+                    hints = [l[:120] for l in lines if "mã" in l.lower() or "code" in l.lower()][:15]
+                    short = [l for l in lines if 4 <= len(l) <= 20 and any(c.isdigit() for c in l)][:15]
+                    return {
+                        "label": label,
+                        "url": page.url,
+                        "hints": hints,
+                        "short_lines_with_digits": short,
+                        "tail": " | ".join(lines[-10:])[:400]
+                    }
 
-                # Bước 5: bấm thử một link bất kỳ rồi quay lại vị trí đó
+                shots = []
+                time.sleep(15)  # chờ đếm ngược
+                shots.append(snapshot("sau 15 giây chờ, CHƯA bấm link nào"))
+
+                # Bước 5: bấm một link bất kỳ cùng trang (trừ link đầu tiên, thường là logo), rồi quay lại
                 try:
-                    link = page.locator('a[href]:visible').first
-                    link.click(timeout=3000, no_wait_after=True)
-                    steps.append("Đã bấm 1 link bất kỳ")
+                    links = page.locator('a[href]:visible')
+                    total = links.count()
+                    pick = links.nth(2) if total > 3 else links.first
+                    pick.click(timeout=3000, no_wait_after=True)
+                    steps.append("Đã bấm 1 link (trong " + str(total) + " link thấy được)")
                 except Exception as e:
                     steps.append("Không bấm được link: " + str(e)[:80])
-                time.sleep(5)
-                steps.append("Địa chỉ hiện tại: " + page.url)
+                time.sleep(4)
+                steps.append("Sau khi bấm link, địa chỉ: " + page.url)
+                shots.append(snapshot("ngay sau khi bấm link"))
 
-                # Báo lại những dòng chữ có vẻ liên quan đến mã
-                body = ""
                 try:
-                    body = page.inner_text("body")
+                    page.go_back(timeout=8000)
+                    steps.append("Đã quay lại trang trước")
+                except Exception as e:
+                    steps.append("Không quay lại được: " + str(e)[:80])
+                time.sleep(6)
+                try:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 except Exception:
                     pass
-                lines = [l.strip() for l in body.splitlines() if l.strip()]
-                hints = [l[:120] for l in lines if "mã" in l.lower() or "code" in l.lower()][:15]
-                return {"steps": steps, "hints": hints, "tail": " | ".join(lines[-12:])[:600]}
+                shots.append(snapshot("sau khi quay lại và kéo xuống cuối"))
+
+                return {"steps": steps, "snapshots": shots}
             finally:
                 browser.close()
     except Exception as e:
