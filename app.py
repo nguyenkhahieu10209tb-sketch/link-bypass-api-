@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 app = Flask(__name__)
 CORS(app)
@@ -35,18 +36,34 @@ class Stop(Exception):
 
 # ---- Các đoạn JavaScript chạy trong trang đích ----
 
-# Tìm nút "LẤY MÃ" SÂU NHẤT (nút thật ưu tiên nút L4M Lấy mã), không phải khung bao bên ngoài chứa chữ đó.
+# Ưu tiên tìm nút L4M Lấy mã / logo L4M, sau đó mới đến các nút chung chung
 FIND_JS = """
-const vis=e=>{const r=e.getBoundingClientRect();return e.offsetParent!==null&&r.width>25&&r.height>12};
-const txt=e=>((e.innerText||e.value||'')+'').trim().toLowerCase();
-const hit=[...document.querySelectorAll('a,button,[role=button],input[type=button],input[type=submit],img,div,span,p')]
-  .filter(e=>{const t=txt(e);return vis(e)&&((t&&t.length<60&&/lấy mã|get code/.test(t))||(e.tagName==='IMG'&&/l4m|link4m|lay-?ma|get-?code/.test(((e.alt||'')+' '+(e.title||'')+' '+(e.src||'')).toLowerCase())))});
-const el=hit.find(e=>!hit.some(o=>o!==e&&e.contains(o)))||null;
+const vis = e => { const r = e.getBoundingClientRect(); return e.offsetParent !== null && r.width > 20 && r.height > 10; };
+const txt = e => ((e.innerText || e.value || '') + '').trim().toLowerCase();
+
+const l4mElements = [...document.querySelectorAll('a, button, [role=button], div, span, img')]
+  .filter(e => {
+    if (!vis(e)) return false;
+    const innerText = txt(e);
+    const htmlContent = (e.outerHTML || '').toLowerCase();
+    return /l4m|link4m/.test(htmlContent) || /l4m lầy mã|l4m lấy mã|lấy mã/.test(innerText);
+  });
+
+let el = l4mElements.find(e => !l4mElements.some(o => o !== e && e.contains(o))) || null;
+
+if (!el) {
+  const hit = [...document.querySelectorAll('a, button, [role=button], input[type=button], input[type=submit], div, span, p')]
+    .filter(e => {
+      const t = txt(e);
+      return vis(e) && t && t.length < 60 && /lấy mã|get code/.test(t);
+    });
+  el = hit.find(e => !hit.some(o => o !== e && e.contains(o))) || null;
+}
+el;
 """
 CLICK_JS = "()=>{" + FIND_JS + "if(!el)return null;el.scrollIntoView({block:'center'});el.click();return el.tagName+': '+txt(el).slice(0,40)}"
 SCROLL_JS = "()=>{" + FIND_JS + "if(el)el.scrollIntoView({block:'center'});return !!el}"
 
-# Ưu tiên dòng có đếm ngược (vd 'Vui lòng chờ 60s'); không có thì lấy dòng ngắn nhất liên quan nút/lấy mã(ưu tiên) hoặc biểu tượng nút start
 BTN_JS = r"""()=>{
   const re=/(Vui lòng chờ|Lấy mã sau|LẤY MÃ|lấy mã|Vui lòng click|Mã KM|L4M Lấy Mã|Code)/i,cd=/\b\d+\s*(?:s\b|giây)/i;
   let a=null,b=null;
@@ -58,13 +75,11 @@ BTN_JS = r"""()=>{
   }
   return a||b;}"""
 
-# Đọc mã theo nhãn "Mã KM / Mã xác nhận / Mã nhận được / Code:".
 READ_JS = r"""()=>{
   const t=document.body?document.body.innerText:'';
   const m=t.match(/(?:mã\s*km|mã\s*xác\s*nhận|mã\s*nhận\s*được|your\s*code)\s*[:：]?\s*([A-Za-z0-9]{4,15})\b|\bcode\s*[:：]\s*([A-Za-z0-9]{4,15})\b/i);
   return m?(m[1]||m[2]):null;}"""
 
-# Bấm một link nội bộ (đăng ký, đăng nhập, nạp, rút, tải app, link ngoài trang).
 MENU_JS = r"""()=>{
   const bad=/đăng ký|đăng nhập|nạp|rút|register|login|deposit|withdraw|tải|download/i;
   const ok=a=>a.offsetParent!==null&&a.origin===location.origin&&a.href!==location.href&&!a.href.includes('#')&&!bad.test((a.innerText||'')+' '+a.href);
@@ -93,18 +108,23 @@ def run_job(job_id, domain, max_wait):
                     viewport={"width": 1280, "height": 800},
                     locale="vi-VN",
                     timezone_id="Asia/Ho_Chi_Minh",
+                    device_scale_factor=1,
+                    has_touch=False,
+                    is_mobile=False,
                     extra_http_headers={
                         "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-                        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"'
+                        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                        "Sec-Ch-Ua-Platform": '"Windows"'
                     },
                 )
 
-                # Bổ sung giả lập chống phát hiện bot và chống lỗi ẩn danh (Storage quota & filesystem)
+                # Bổ sung giả lập toàn diện (Storage quota, IndexedDB, FileSystem) chống phát hiện ẩn danh
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     window.chrome = window.chrome || { runtime: {} };
                     Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                    Object.defineProperty(navigator, 'vendor', {get: () => 'Google Inc.'});
                     
                     if (navigator.storage && navigator.storage.estimate) {
                         navigator.storage.estimate = () => Promise.resolve({
@@ -113,18 +133,21 @@ def run_job(job_id, domain, max_wait):
                         });
                     }
                     
+                    window.indexedDB = window.indexedDB || window.mozIndexedDB || window.webkitIndexedDB;
                     window.webkitRequestFileSystem = window.webkitRequestFileSystem || function(a, b, c, d) {
                         if (c) c({ name: 'MockFileSystem' });
                     };
                 """)
 
                 page = context.new_page()
-                hosts = {}
+                
+                # Kích hoạt playwright-stealth để vượt mọi cơ chế phát hiện bot
+                stealth_sync(page)
 
+                hosts = {}
                 def on_req(r):
                     h = urlparse(r.url).hostname or "?"
                     hosts[h] = hosts.get(h, 0) + 1
-
                 page.on("request", on_req)
 
                 def pause(sec):
@@ -226,18 +249,10 @@ def run_job(job_id, domain, max_wait):
                             t: document.title || '',
                             h: document.body ? document.body.scrollHeight : 0,
                             n: ((document.body ? document.body.innerText : '').toLowerCase().split('lấy mã').length - 1),
-                            f: document.querySelectorAll('iframe').length,
-                            x: [...document.querySelectorAll('body *')].filter(e=>{const t=(e.innerText||'').trim();return t&&t.length<120&&getComputedStyle(e).position==='fixed'}).slice(0,4).map(e=>e.innerText.trim().split(String.fromCharCode(10)).join(' ').slice(0,60)),
-                            c: [...document.querySelectorAll('img,div,a,button')].filter(e=>/l4m|link4m|get-?code|lay-?ma/i.test((e.id||'')+' '+(typeof e.className==='string'?e.className:'')+' '+(e.alt||'')+' '+(e.src||''))).slice(0,6).map(e=>e.tagName+'#'+(e.id||'')+'.'+(typeof e.className==='string'?e.className:'').slice(0,40)+' '+Math.round(e.getBoundingClientRect().width)+'x'+Math.round(e.getBoundingClientRect().height))
+                            f: document.querySelectorAll('iframe').length
                         })""")
-                        log("Chẩn đoán: tiêu đề='%s' | cao=%spx | chữ 'lấy mã' xuất hiện %s lần | iframe=%s"
-                            % (i["t"][:40], i["h"], i["n"], i["f"]))
+                        log("Chẩn đoán: tiêu đề='%s' | cao=%spx | iframe=%s" % (i["t"][:40], i["h"], i["f"]))
                         log("Địa chỉ hiện tại: " + page.url[:100])
-                        log("Phần tử nghi của Link4m: " + (" ; ".join(i["c"]) or "không có"))
-                        log("Khung nổi trên trang: " + (" | ".join(i["x"]) or "không có"))
-                        ext = sorted(h for h in hosts if h and h != domain and not h.endswith("." + domain))
-                        hot = [h for h in ext if "link4m" in h or "l4m" in h]
-                        log("Yêu cầu tới link4m: " + (", ".join(hot) or "KHÔNG có yêu cầu nào"))
                     except Exception as e:
                         log("Chẩn đoán lỗi: " + str(e)[:80])
 
