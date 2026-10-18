@@ -1,12 +1,8 @@
 import os
 import re
-import html
-import json
 import uuid
-import random
 import time
 import threading
-from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
@@ -31,6 +27,55 @@ BROWSER_ARGS = [
 JOBS = {}
 JOB_LOCK = threading.Lock()
 
+
+class Stop(Exception):
+    """Dừng tiến trình có chủ đích, kèm lời giải thích hiện cho người dùng."""
+
+
+# ---- Các đoạn JavaScript chạy trong trang đích ----
+
+# Tìm nút "LẤY MÃ" SÂU NHẤT (nút thật), không phải khung bao bên ngoài chứa chữ đó.
+FIND_JS = """
+const vis=e=>{const r=e.getBoundingClientRect();return e.offsetParent!==null&&r.width>25&&r.height>12};
+const txt=e=>((e.innerText||e.value||'')+'').trim().toLowerCase();
+const hit=[...document.querySelectorAll('a,button,[role=button],input[type=button],input[type=submit],img,div,span,p')]
+  .filter(e=>{const t=txt(e);return vis(e)&&((t&&t.length<60&&/lấy mã|get code/.test(t))||(e.tagName==='IMG'&&/l4m|link4m|lay-?ma|get-?code/.test(((e.alt||'')+' '+(e.title||'')+' '+(e.src||'')).toLowerCase())))});
+const el=hit.find(e=>!hit.some(o=>o!==e&&e.contains(o)))||null;
+"""
+CLICK_JS = "()=>{" + FIND_JS + "if(!el)return null;el.scrollIntoView({block:'center'});el.click();return el.tagName+': '+txt(el).slice(0,40)}"
+SCROLL_JS = "()=>{" + FIND_JS + "if(el)el.scrollIntoView({block:'center'});return !!el}"
+
+# Ưu tiên dòng có đếm ngược (vd 'Vui lòng chờ 59s'); không có thì lấy dòng ngắn nhất liên quan nút/mã.
+BTN_JS = r"""()=>{
+  const re=/(Vui lòng chờ|Lấy mã sau|LẤY MÃ|lấy mã|Vui lòng click|Mã KM|Code)/i,cd=/\b\d+\s*(?:s\b|giây)/i;
+  let a=null,b=null;
+  for(const el of document.querySelectorAll('a,button,div,span,p')){
+    if(el.children.length>3)continue;
+    const t=(el.innerText||'').trim();
+    if(!t||t.length>=160||!re.test(t))continue;
+    if(cd.test(t)){if(!a||t.length<a.length)a=t}else if(!b||t.length<b.length)b=t;
+  }
+  return a||b;}"""
+
+# Đọc mã theo nhãn "Mã KM / Mã xác nhận / Mã nhận được / Code:".
+READ_JS = r"""()=>{
+  const t=document.body?document.body.innerText:'';
+  const m=t.match(/(?:mã\s*km|mã\s*xác\s*nhận|mã\s*nhận\s*được|your\s*code)\s*[:：]?\s*([A-Za-z0-9]{4,15})\b|\bcode\s*[:：]\s*([A-Za-z0-9]{4,15})\b/i);
+  return m?(m[1]||m[2]):null;}"""
+
+# Bấm một link nội bộ vô hại (bỏ qua đăng ký, đăng nhập, nạp, rút, tải app, link ngoài trang).
+MENU_JS = r"""()=>{
+  const bad=/đăng ký|đăng nhập|nạp|rút|register|login|deposit|withdraw|tải|download/i;
+  const ok=a=>a.offsetParent!==null&&a.origin===location.origin&&a.href!==location.href&&!a.href.includes('#')&&!bad.test((a.innerText||'')+' '+a.href);
+  const links=[...document.querySelectorAll('a[href]')].filter(ok);
+  const keys=['giới thiệu','chính sách','quyền riêng tư','điều khoản','liên hệ','tin tức','bài viết'];
+  for(const k of keys){const a=links.find(x=>(x.innerText||'').toLowerCase().includes(k));if(a){a.scrollIntoView({block:'center'});a.click();return k}}
+  const a=links.find(x=>(x.getAttribute('href')||'').length>1);
+  if(a){a.scrollIntoView({block:'center'});a.click();return 'link bất kỳ'}
+  return null;}"""
+# ---- end js ----
+
+
 def run_job(job_id, domain, max_wait):
     job = JOBS[job_id]
 
@@ -52,244 +97,206 @@ def run_job(job_id, domain, max_wait):
                         "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"'
                     },
                 )
-                
+
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     window.chrome = window.chrome || { runtime: {} };
                     Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
                 """)
-                
+
                 page = context.new_page()
 
                 def pause(sec):
                     page.wait_for_timeout(int(sec * 1000))
+                    if job.get("cancel"):
+                        raise Stop("Đã hủy theo yêu cầu.")
+
+                def ev(js):
+                    """Chạy JS ở trang chính rồi tới từng iframe; trả về kết quả có giá trị đầu tiên."""
+                    for fr in page.frames:
+                        try:
+                            r = fr.evaluate(js)
+                            if r:
+                                return r
+                        except Exception:
+                            pass
+                    return None
 
                 def shot():
                     try:
-                        page.evaluate("""() => {
-                            const btn = Array.from(document.querySelectorAll('a,button,div')).find(el => /lấy mã|mã km|code/i.test(el.innerText));
-                            if (btn) btn.scrollIntoView({behavior: 'smooth', block: 'center'});
-                        }""")
-                        pause(0.5)
+                        ev(SCROLL_JS)
+                        page.wait_for_timeout(400)
                         job["shot"] = page.screenshot(type="jpeg", quality=50)
                     except Exception:
                         pass
 
                 def human_reading_scroll():
                     try:
-                        page.evaluate("""() => {
-                            window.scrollBy({top: window.innerHeight * 0.5, behavior: 'smooth'});
-                        }""")
+                        page.evaluate("() => window.scrollBy({top: window.innerHeight * 0.5, behavior: 'smooth'})")
                         pause(1.2)
-                        page.evaluate("""() => {
-                            window.scrollBy({top: -window.innerHeight * 0.25, behavior: 'smooth'});
-                        }""")
+                        page.evaluate("() => window.scrollBy({top: -window.innerHeight * 0.25, behavior: 'smooth'})")
+                    except Stop:
+                        raise
                     except Exception:
                         pass
 
                 def button_text():
-                    try:
-                        return page.evaluate("""() => {
-                            const re = /(Vui lòng chờ|Lấy mã sau|LẤY MÃ|lấy mã|Vui lòng click|Mã KM|Code)/i;
-                            let best = null;
-                            for (const el of document.querySelectorAll('a,button,div,span,p')) {
-                                if (el.children.length > 3) continue;
-                                const t = (el.innerText || '').trim();
-                                if (t && t.length < 160 && re.test(t) && (!best || t.length < best.length)) best = t;
-                            }
-                            return best;
-                        }""")
-                    except Exception:
-                        return None
+                    return ev(BTN_JS)
 
-                def click_lay_ma():
-                    try:
-                        clicked = page.evaluate("""() => {
-                            const elements = Array.from(document.querySelectorAll('a, button, div, span, p'));
-                            for (const el of elements) {
-                                const t = (el.innerText || '').trim().toLowerCase();
-                                if ((t.includes('lấy mã') || t.includes('get code')) && el.offsetParent !== null) {
-                                    const rect = el.getBoundingClientRect();
-                                    if (rect.width > 25 && rect.height > 12) {
-                                        el.scrollIntoView({behavior: 'smooth', block: 'center'});
-                                        el.click();
-                                        return true;
-                                    }
-                                }
-                            }
-                            return false;
-                        }""")
-                        if clicked:
+                def read():
+                    c = ev(READ_JS)
+                    return c.strip() if c else None
+
+                def click_btn(tries, gap=4):
+                    """Tìm và bấm nút LẤY MÃ. Trả về mô tả nút đã bấm, hoặc None nếu không thấy."""
+                    for _ in range(tries):
+                        try:
+                            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        except Exception:
+                            pass
+                        r = ev(CLICK_JS)
+                        if r:
                             pause(2)
-                            return "JS_Click_Success"
-                    except Exception as e:
-                        log("Lỗi click JS: " + str(e)[:50])
+                            return r
+                        pause(gap)
                     return None
 
-                def click_random_menu_link():
+                def click_menu_link():
                     try:
-                        clicked = page.evaluate("""() => {
-                            const links = Array.from(document.querySelectorAll('a[href]'));
-                            const keywords = ['giới thiệu', 'chính sách', 'quyền riêng tư', 'điều khoản', 'đăng ký', 'đăng nhập', 'nạp tiền', 'rút tiền', 'tải app', 'khuyến mãi'];
-                            for (const kw of keywords) {
-                                for (const a of links) {
-                                    if (a.offsetParent !== null && (a.innerText || '').toLowerCase().includes(kw)) {
-                                        a.scrollIntoView({behavior: 'smooth', block: 'center'});
-                                        a.click();
-                                        return kw;
-                                    }
-                                }
-                            }
-                            for (const a of links) {
-                                if (a.offsetParent !== null && (a.getAttribute('href') || '').length > 1) {
-                                    a.scrollIntoView({behavior: 'smooth', block: 'center'});
-                                    a.click();
-                                    return 'random_link';
-                                }
-                            }
-                            return null;
-                        }""")
-                        if clicked:
-                            log(f"Đã bấm vào trang bất kỳ/menu: '{clicked}'")
+                        k = page.evaluate(MENU_JS)
+                        if k:
+                            log("Đã bấm vào trang phụ: '" + str(k) + "'")
                             pause(4)
                             return True
+                    except Stop:
+                        raise
                     except Exception as e:
-                        log("Lỗi click trang bất kỳ: " + str(e)[:80])
+                        if "destroyed" in str(e) or "navigat" in str(e):
+                            log("Đã bấm vào một link, trang đang chuyển...")
+                            pause(4)
+                            return True
+                        log("Lỗi bấm link phụ: " + str(e)[:80])
                     return False
 
+                def click_link_and_return():
+                    """Bấm một link trong trang rồi quay lại đúng trang cũ (bước 5 của Link4m)."""
+                    origin = page.url
+                    if not click_menu_link():
+                        log("Không tìm được link phù hợp để bấm.")
+                        return False
+                    for extra in list(context.pages):
+                        if extra != page:
+                            try:
+                                extra.close()
+                            except Exception:
+                                pass
+                    if page.url != origin:
+                        log("Đang quay lại trang cũ...")
+                        try:
+                            page.go_back(wait_until="domcontentloaded", timeout=20000)
+                        except Exception as e:
+                            log("Lỗi quay lại: " + str(e)[:80])
+                            page.goto(origin, timeout=30000, wait_until="domcontentloaded")
+                        pause(4)
+                    return True
+
+                def diag():
+                    """Ghi vài số liệu thật của trang để biết vì sao không thấy nút / mã."""
+                    try:
+                        i = page.evaluate("""() => ({
+                            t: document.title || '',
+                            h: document.body ? document.body.scrollHeight : 0,
+                            n: ((document.body ? document.body.innerText : '').toLowerCase().split('lấy mã').length - 1),
+                            f: document.querySelectorAll('iframe').length,
+                            c: [...document.querySelectorAll('img,div,a,button')].filter(e=>/l4m|link4m|get-?code|lay-?ma/i.test((e.id||'')+' '+(typeof e.className==='string'?e.className:'')+' '+(e.alt||'')+' '+(e.src||''))).slice(0,6).map(e=>e.tagName+'#'+(e.id||'')+'.'+(typeof e.className==='string'?e.className:'').slice(0,40)+' '+Math.round(e.getBoundingClientRect().width)+'x'+Math.round(e.getBoundingClientRect().height))
+                        })""")
+                        log("Chẩn đoán: tiêu đề='%s' | cao=%spx | chữ 'lấy mã' xuất hiện %s lần | iframe=%s"
+                            % (i["t"][:40], i["h"], i["n"], i["f"]))
+                        log("Địa chỉ hiện tại: " + page.url[:100])
+                        log("Phần tử nghi của Link4m: " + (" ; ".join(i["c"]) or "không có"))
+                    except Exception as e:
+                        log("Chẩn đoán lỗi: " + str(e)[:80])
+
+                def countdown(cap):
+                    """Đợi đếm ngược, thoát ngay khi thấy mã. Không đợi vô ích nếu không có đếm ngược."""
+                    t_start = time.time()
+                    seen = False
+                    quiet = 0
+                    last = None
+                    while time.time() - t_start < cap and time.time() < deadline:
+                        c = read()
+                        if c:
+                            return c
+                        txt = button_text() or ""
+                        if txt != last:
+                            log("Trạng thái: " + (txt or "(không thấy chữ nào)"))
+                            last = txt
+                            shot()
+                        if re.search(r'\b\d+\s*(?:s\b|giây)', txt, re.IGNORECASE):
+                            seen = True
+                            quiet = 0
+                        else:
+                            quiet += 1
+                        if (seen and quiet >= 2) or (not seen and time.time() - t_start > 20):
+                            break
+                        human_reading_scroll()
+                        pause(3)
+                    return read()
+
+                # ---------------- Luồng chính ----------------
                 log("Bước 1: Mở trang đích: " + domain)
                 page.goto("https://" + domain, timeout=30000,
                           wait_until="domcontentloaded",
                           referer="https://www.google.com/")
                 pause(4)
                 shot()
-                
+
                 deadline = time.time() + max_wait
-                last_state = None
-                step_phase = "PRE_CHECK"
-                timer_start_v1 = 0
-                timer_start_v2 = 0
-                code = None
-
-                while time.time() < deadline:
-                    txt = button_text() or ""
-                    if txt != last_state:
-                        log("Trạng thái: " + (txt if txt else "(đang đếm ngược)"))
-                        last_state = txt
-                        shot()
-                        
-                    m = re.search(r'(?:Mã\s*(?:KM|code|xác nhận|nhận được)?|Code)[:\s]*([A-Za-z0-9]{4,15})', txt, re.IGNORECASE)
-                    if m:
-                        code = m.group(1)
-                        log("ĐÃ TÌM THẤY MÃ: " + code)
-                        shot()
-                        break
-                        
-                    low = txt.lower()
-
-                    if step_phase == "PRE_CHECK":
-                        if "lấy mã" in low or "vui lòng chờ" in low or "code" in low:
-                            step_phase = "SCROLL_TO_BOTTOM_1"
-                        else:
-                            log("Không thấy nút ở trang chủ, đang tìm bài viết/chuyên mục...")
-                            click_random_menu_link()
-                            step_phase = "SCROLL_TO_BOTTOM_1"
-                        pause(2)
-
-                    elif step_phase == "SCROLL_TO_BOTTOM_1":
-                        log("Bước 2: Lướt xuống cuối trang...")
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        pause(2)
-                        log("Bước 3: Ấn nút lấy mã lần 1...")
-                        click_lay_ma()
-                        step_phase = "WAIT_TIMER_1"
-                        timer_start_v1 = time.time()  # Ghim mốc thời gian bắt đầu vòng 1
-                        pause(3)
-
-                    elif step_phase == "WAIT_TIMER_1":
-                        sec_match = re.search(r'(\d+)\s*(?:s|giây)', txt, re.IGNORECASE)
-                        if sec_match:
-                            wait_secs = int(sec_match.group(1))
-                            log(f"Đang đợi đếm ngược vòng 1 ({wait_secs}s)...")
-                            for _ in range(max(1, wait_secs // 3)):
-                                human_reading_scroll()
-                                pause(3)
-                            step_phase = "CHECK_NEXT_ACTION"
-                        else:
-                            # PHÒNG HỜ: Nếu regex không bắt được số giây, ép buộc đợi cứng ít nhất 50 giây rồi mới qua bước sau
-                            elapsed_v1 = time.time() - timer_start_v1
-                            if elapsed_v1 < 50:
-                                human_reading_scroll()
-                                pause(3)
-                            else:
-                                log("Đã hoàn tất thời gian chờ vòng 1 (fallback)...")
-                                step_phase = "CHECK_NEXT_ACTION"
-
-                    elif step_phase == "CHECK_NEXT_ACTION":
-                        log("Bước 4: Tiến hành click vào link menu/trang phụ theo yêu cầu...")
-                        click_random_menu_link()
-                        pause(3)
-                        step_phase = "SCROLL_TO_BOTTOM_2"
-
-                    elif step_phase == "SCROLL_TO_BOTTOM_2":
-                        log("Bước 5: Lướt xuống cuối trang để lấy mã lần 2...")
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        pause(2)
-                        log("Ấn nút lấy mã lần 2...")
-                        click_lay_ma()
-                        step_phase = "WAIT_TIMER_2"
-                        timer_start_v2 = time.time()
-                        pause(3)
-
-                    elif step_phase == "WAIT_TIMER_2":
-                        sec_match = re.search(r'(\d+)\s*(?:s|giây)', txt, re.IGNORECASE)
-                        if sec_match:
-                            wait_secs = int(sec_match.group(1))
-                            log(f"Đang đợi đếm ngược vòng cuối ({wait_secs}s)...")
-                            for _ in range(max(1, wait_secs // 3)):
-                                human_reading_scroll()
-                                pause(3)
-                        else:
-                            elapsed_v2 = time.time() - timer_start_v2
-                            if elapsed_v2 < 55:
-                                human_reading_scroll()
-                                pause(3)
-                            else:
-                                log("Hết thời gian chờ vòng 2, tiến hành quét sâu toàn trang lấy mã...")
-                                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                                pause(2)
-                                
-                                code_found = page.evaluate("""() => {
-                                    const bodyText = document.body.innerText;
-                                    const match = bodyText.match(/(?:mã\\s*(?:km|code|xác nhận|nhận được)?|code)[:\\s]*([A-Za-z0-9]{4,15})/i);
-                                    if (match) return match[1];
-                                    
-                                    const codeBox = document.querySelector('input[readonly], .code-result, #code, .get-code-result, .mã-km');
-                                    if (codeBox) return codeBox.value || codeBox.innerText;
-                                    
-                                    return null;
-                                }""")
-                                
-                                if code_found:
-                                    code = code_found.strip()
-                                    log("ĐÃ TÌM THẤY MÃ (QUÉT TOÀN TRANG): " + code)
-                                    shot()
-                                    break
-                                else:
-                                    log("Đang kích hoạt lại nút bấm lần cuối để ép nhả mã...")
-                                    click_lay_ma()
-                                    pause(4)
-                    else:
-                        human_reading_scroll()
-                        pause(2)
+                code = read()
 
                 if not code:
-                    log("Hết thời gian (" + str(max_wait) + "s) mà chưa lấy được mã.")
-                job["result"] = {"code": code, "last_button_text": last_state, "url": page.url}
+                    log("Bước 2: Tìm nút LẤY MÃ (lần 1)...")
+                    hit = click_btn(5)
+                    if not hit:
+                        diag()
+                        shot()
+                        raise Stop("Trang đích không hiện nút LẤY MÃ cho máy chủ (xem dòng chẩn đoán). "
+                                   "Có thể trang chỉ hiện nút cho thiết bị đã mở link rút gọn.")
+                    log("Đã bấm: " + hit)
+                    code = countdown(60)
+
+                    if not code:
+                        log("Bước 3: Bấm một link trong trang rồi quay lại vị trí cũ...")
+                        click_link_and_return()
+                        log("Bước 4: Tìm nút LẤY MÃ (lần 2)...")
+                        hit = click_btn(4)
+                        if hit:
+                            log("Đã bấm: " + hit)
+                        else:
+                            log("Không thấy nút lần 2, thử đợi mã tự hiện...")
+                        code = countdown(140)
+
+                    tries = 0
+                    while not code and tries < 3 and time.time() < deadline:
+                        tries += 1
+                        log("Chưa thấy mã, quét lại (%d/3)..." % tries)
+                        ev(CLICK_JS)
+                        pause(8)
+                        code = read()
+
+                if code:
+                    log("ĐÃ CÓ MÃ: " + code)
+                else:
+                    diag()
+                    log("Hết thời gian hoặc không thấy mã (" + str(max_wait) + "s).")
                 shot()
+                job["result"] = {"code": code, "url": page.url}
             finally:
                 browser.close()
+    except Stop as e:
+        job["result"] = {"code": None, "exception": str(e)}
+        log(str(e))
     except Exception as e:
         job["result"] = {"exception": str(e)[:500]}
         log("LỖI HỆ THỐNG: " + str(e)[:200])
@@ -320,22 +327,31 @@ def getcode_endpoint():
         for j in list(JOBS.values()):
             if j["status"] == "running":
                 return jsonify({"id": j["id"], "reused": True})
-        
+
         job_id = uuid.uuid4().hex[:8]
         JOBS[job_id] = {
-            "id": job_id, 
-            "status": "running", 
-            "log": [], 
+            "id": job_id,
+            "status": "running",
+            "log": [],
             "result": None,
-            "shot": None, 
-            "t0": time.time(), 
+            "shot": None,
+            "cancel": False,
+            "t0": time.time(),
             "domain": domain
         }
         for old in list(JOBS.keys())[:-5]:
             del JOBS[old]
-            
+
     threading.Thread(target=run_job, args=(job_id, domain, max_wait), daemon=True).start()
     return jsonify({"id": job_id, "status": "running"})
+
+
+@app.route('/cancel', methods=['GET'])
+def cancel_endpoint():
+    job = JOBS.get(request.args.get('id', ''))
+    if job and job["status"] == "running":
+        job["cancel"] = True
+    return jsonify({"ok": True})
 
 
 @app.route('/job', methods=['GET'])
@@ -344,9 +360,9 @@ def job_endpoint():
     if not job:
         return jsonify({"error": "Không tìm thấy tiến trình"}), 404
     return jsonify({
-        "status": job["status"], 
+        "status": job["status"],
         "elapsed": round(time.time() - job["t0"]),
-        "log": job["log"], 
+        "log": job["log"],
         "result": job["result"]
     })
 
