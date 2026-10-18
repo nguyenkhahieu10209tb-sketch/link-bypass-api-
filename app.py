@@ -35,7 +35,7 @@ class Stop(Exception):
 
 # ---- Các đoạn JavaScript chạy trong trang đích ----
 
-# Tìm nút "LẤY MÃ" SÂU NHẤT (nút thật), không phải khung bao bên ngoài chứa chữ đó.
+# Tìm nút "LẤY MÃ" SÂU NHẤT (nút thật ưu tiên nút L4M Lấy mã), không phải khung bao bên ngoài chứa chữ đó.
 FIND_JS = """
 const vis=e=>{const r=e.getBoundingClientRect();return e.offsetParent!==null&&r.width>25&&r.height>12};
 const txt=e=>((e.innerText||e.value||'')+'').trim().toLowerCase();
@@ -46,9 +46,9 @@ const el=hit.find(e=>!hit.some(o=>o!==e&&e.contains(o)))||null;
 CLICK_JS = "()=>{" + FIND_JS + "if(!el)return null;el.scrollIntoView({block:'center'});el.click();return el.tagName+': '+txt(el).slice(0,40)}"
 SCROLL_JS = "()=>{" + FIND_JS + "if(el)el.scrollIntoView({block:'center'});return !!el}"
 
-# Ưu tiên dòng có đếm ngược (vd 'Vui lòng chờ 59s'); không có thì lấy dòng ngắn nhất liên quan nút/mã.
+# Ưu tiên dòng có đếm ngược (vd 'Vui lòng chờ 60s'); không có thì lấy dòng ngắn nhất liên quan nút/lấy mã(ưu tiên) hoặc biểu tượng nút start(hình tam giác xoay ngang sang bên phải)
 BTN_JS = r"""()=>{
-  const re=/(Vui lòng chờ|Lấy mã sau|LẤY MÃ|lấy mã|Vui lòng click|Mã KM|Code)/i,cd=/\b\d+\s*(?:s\b|giây)/i;
+  const re=/(Vui lòng chờ|Lấy mã sau|LẤY MÃ|lấy mã|Vui lòng click|Mã KM|L4M Lấy Mã|Code)/i,cd=/\b\d+\s*(?:s\b|giây)/i;
   let a=null,b=null;
   for(const el of document.querySelectorAll('a,button,div,span,p')){
     if(el.children.length>3)continue;
@@ -64,7 +64,7 @@ READ_JS = r"""()=>{
   const m=t.match(/(?:mã\s*km|mã\s*xác\s*nhận|mã\s*nhận\s*được|your\s*code)\s*[:：]?\s*([A-Za-z0-9]{4,15})\b|\bcode\s*[:：]\s*([A-Za-z0-9]{4,15})\b/i);
   return m?(m[1]||m[2]):null;}"""
 
-# Bấm một link nội bộ vô hại (bỏ qua đăng ký, đăng nhập, nạp, rút, tải app, link ngoài trang).
+# Bấm một link nội bộ ( đăng ký, đăng nhập, nạp, rút, tải app, link ngoài trang).
 MENU_JS = r"""()=>{
   const bad=/đăng ký|đăng nhập|nạp|rút|register|login|deposit|withdraw|tải|download/i;
   const ok=a=>a.offsetParent!==null&&a.origin===location.origin&&a.href!==location.href&&!a.href.includes('#')&&!bad.test((a.innerText||'')+' '+a.href);
@@ -237,7 +237,7 @@ def run_job(job_id, domain, max_wait):
                         log("Chẩn đoán lỗi: " + str(e)[:80])
 
                 def countdown(cap):
-                    """Đợi đếm ngược, thoát ngay khi thấy mã. Không đợi vô ích nếu không có đếm ngược."""
+                    """Đợi đếm ngược,sao chép và thoát ngay khi thấy mã. Không đợi vô ích nếu không có đếm ngược."""
                     t_start = time.time()
                     seen = False
                     quiet = 0
