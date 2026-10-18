@@ -3,6 +3,7 @@ import re
 import uuid
 import time
 import threading
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
@@ -106,6 +107,13 @@ def run_job(job_id, domain, max_wait):
                 """)
 
                 page = context.new_page()
+                hosts = {}
+
+                def on_req(r):
+                    h = urlparse(r.url).hostname or "?"
+                    hosts[h] = hosts.get(h, 0) + 1
+
+                page.on("request", on_req)
 
                 def pause(sec):
                     page.wait_for_timeout(int(sec * 1000))
@@ -204,17 +212,27 @@ def run_job(job_id, domain, max_wait):
                 def diag():
                     """Ghi vài số liệu thật của trang để biết vì sao không thấy nút / mã."""
                     try:
+                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(500)
                         i = page.evaluate("""() => ({
                             t: document.title || '',
                             h: document.body ? document.body.scrollHeight : 0,
                             n: ((document.body ? document.body.innerText : '').toLowerCase().split('lấy mã').length - 1),
                             f: document.querySelectorAll('iframe').length,
+                            x: [...document.querySelectorAll('body *')].filter(e=>{const t=(e.innerText||'').trim();return t&&t.length<120&&getComputedStyle(e).position==='fixed'}).slice(0,4).map(e=>e.innerText.trim().split(String.fromCharCode(10)).join(' ').slice(0,60)),
                             c: [...document.querySelectorAll('img,div,a,button')].filter(e=>/l4m|link4m|get-?code|lay-?ma/i.test((e.id||'')+' '+(typeof e.className==='string'?e.className:'')+' '+(e.alt||'')+' '+(e.src||''))).slice(0,6).map(e=>e.tagName+'#'+(e.id||'')+'.'+(typeof e.className==='string'?e.className:'').slice(0,40)+' '+Math.round(e.getBoundingClientRect().width)+'x'+Math.round(e.getBoundingClientRect().height))
                         })""")
                         log("Chẩn đoán: tiêu đề='%s' | cao=%spx | chữ 'lấy mã' xuất hiện %s lần | iframe=%s"
                             % (i["t"][:40], i["h"], i["n"], i["f"]))
                         log("Địa chỉ hiện tại: " + page.url[:100])
                         log("Phần tử nghi của Link4m: " + (" ; ".join(i["c"]) or "không có"))
+                        log("Khung nổi trên trang: " + (" | ".join(i["x"]) or "không có"))
+                        ext = sorted(h for h in hosts if h and h != domain and not h.endswith("." + domain))
+                        hot = [h for h in ext if "link4m" in h or "l4m" in h]
+                        log("Yêu cầu tới link4m: " + (", ".join(hot) or "KHÔNG có yêu cầu nào"))
+                        txt = ", ".join(ext)
+                        for k in range(0, min(len(txt), 840), 280):
+                            log("Tên miền ngoài: " + txt[k:k + 280])
                     except Exception as e:
                         log("Chẩn đoán lỗi: " + str(e)[:80])
 
@@ -289,7 +307,7 @@ def run_job(job_id, domain, max_wait):
                     log("ĐÃ CÓ MÃ: " + code)
                 else:
                     diag()
-                    log("Hết thời gian hoặc không thấy mã (" + str(max_wait) + "s).")
+                    log("Hết thời gian chờ mà chưa thấy mã (đã dùng " + str(round(time.time() - job["t0"])) + "s).")
                 shot()
                 job["result"] = {"code": code, "url": page.url}
             finally:
