@@ -46,7 +46,7 @@ const el=hit.find(e=>!hit.some(o=>o!==e&&e.contains(o)))||null;
 CLICK_JS = "()=>{" + FIND_JS + "if(!el)return null;el.scrollIntoView({block:'center'});el.click();return el.tagName+': '+txt(el).slice(0,40)}"
 SCROLL_JS = "()=>{" + FIND_JS + "if(el)el.scrollIntoView({block:'center'});return !!el}"
 
-# Ưu tiên dòng có đếm ngược (vd 'Vui lòng chờ 60s'); không có thì lấy dòng ngắn nhất liên quan nút/lấy mã(ưu tiên) hoặc biểu tượng nút start(hình tam giác xoay ngang sang bên phải)
+# Ưu tiên dòng có đếm ngược (vd 'Vui lòng chờ 60s'); không có thì lấy dòng ngắn nhất liên quan nút/lấy mã(ưu tiên) hoặc biểu tượng nút start
 BTN_JS = r"""()=>{
   const re=/(Vui lòng chờ|Lấy mã sau|LẤY MÃ|lấy mã|Vui lòng click|Mã KM|L4M Lấy Mã|Code)/i,cd=/\b\d+\s*(?:s\b|giây)/i;
   let a=null,b=null;
@@ -64,7 +64,7 @@ READ_JS = r"""()=>{
   const m=t.match(/(?:mã\s*km|mã\s*xác\s*nhận|mã\s*nhận\s*được|your\s*code)\s*[:：]?\s*([A-Za-z0-9]{4,15})\b|\bcode\s*[:：]\s*([A-Za-z0-9]{4,15})\b/i);
   return m?(m[1]||m[2]):null;}"""
 
-# Bấm một link nội bộ ( đăng ký, đăng nhập, nạp, rút, tải app, link ngoài trang).
+# Bấm một link nội bộ (đăng ký, đăng nhập, nạp, rút, tải app, link ngoài trang).
 MENU_JS = r"""()=>{
   const bad=/đăng ký|đăng nhập|nạp|rút|register|login|deposit|withdraw|tải|download/i;
   const ok=a=>a.offsetParent!==null&&a.origin===location.origin&&a.href!==location.href&&!a.href.includes('#')&&!bad.test((a.innerText||'')+' '+a.href);
@@ -99,11 +99,23 @@ def run_job(job_id, domain, max_wait):
                     },
                 )
 
+                # Bổ sung giả lập chống phát hiện bot và chống lỗi ẩn danh (Storage quota & filesystem)
                 context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     window.chrome = window.chrome || { runtime: {} };
                     Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                    
+                    if (navigator.storage && navigator.storage.estimate) {
+                        navigator.storage.estimate = () => Promise.resolve({
+                            quota: 1024 * 1024 * 1024 * 100,
+                            usage: 1024 * 1024 * 50
+                        });
+                    }
+                    
+                    window.webkitRequestFileSystem = window.webkitRequestFileSystem || function(a, b, c, d) {
+                        if (c) c({ name: 'MockFileSystem' });
+                    };
                 """)
 
                 page = context.new_page()
@@ -121,7 +133,6 @@ def run_job(job_id, domain, max_wait):
                         raise Stop("Đã hủy theo yêu cầu.")
 
                 def ev(js):
-                    """Chạy JS ở trang chính rồi tới từng iframe; trả về kết quả có giá trị đầu tiên."""
                     for fr in page.frames:
                         try:
                             r = fr.evaluate(js)
@@ -157,7 +168,6 @@ def run_job(job_id, domain, max_wait):
                     return c.strip() if c else None
 
                 def click_btn(tries, gap=4):
-                    """Tìm và bấm nút LẤY MÃ. Trả về mô tả nút đã bấm, hoặc None nếu không thấy."""
                     for _ in range(tries):
                         try:
                             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -188,7 +198,6 @@ def run_job(job_id, domain, max_wait):
                     return False
 
                 def click_link_and_return():
-                    """Bấm một link trong trang rồi quay lại đúng trang cũ (bước 5 của Link4m)."""
                     origin = page.url
                     if not click_menu_link():
                         log("Không tìm được link phù hợp để bấm.")
@@ -210,7 +219,6 @@ def run_job(job_id, domain, max_wait):
                     return True
 
                 def diag():
-                    """Ghi vài số liệu thật của trang để biết vì sao không thấy nút / mã."""
                     try:
                         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                         page.wait_for_timeout(500)
@@ -230,14 +238,10 @@ def run_job(job_id, domain, max_wait):
                         ext = sorted(h for h in hosts if h and h != domain and not h.endswith("." + domain))
                         hot = [h for h in ext if "link4m" in h or "l4m" in h]
                         log("Yêu cầu tới link4m: " + (", ".join(hot) or "KHÔNG có yêu cầu nào"))
-                        txt = ", ".join(ext)
-                        for k in range(0, min(len(txt), 840), 280):
-                            log("Tên miền ngoài: " + txt[k:k + 280])
                     except Exception as e:
                         log("Chẩn đoán lỗi: " + str(e)[:80])
 
                 def countdown(cap):
-                    """Đợi đếm ngược,sao chép và thoát ngay khi thấy mã. Không đợi vô ích nếu không có đếm ngược."""
                     t_start = time.time()
                     seen = False
                     quiet = 0
@@ -279,8 +283,7 @@ def run_job(job_id, domain, max_wait):
                     if not hit:
                         diag()
                         shot()
-                        raise Stop("Trang đích không hiện nút LẤY MÃ cho máy chủ (xem dòng chẩn đoán). "
-                                   "Có thể trang chỉ hiện nút cho thiết bị đã mở link rút gọn.")
+                        raise Stop("Trang đích không hiện nút LẤY MÃ cho máy chủ.")
                     log("Đã bấm: " + hit)
                     code = countdown(60)
 
@@ -307,7 +310,7 @@ def run_job(job_id, domain, max_wait):
                     log("ĐÃ CÓ MÃ: " + code)
                 else:
                     diag()
-                    log("Hết thời gian chờ mà chưa thấy mã (đã dùng " + str(round(time.time() - job["t0"])) + "s).")
+                    log("Hết thời gian chờ mà chưa thấy mã.")
                 shot()
                 job["result"] = {"code": code, "url": page.url}
             finally:
