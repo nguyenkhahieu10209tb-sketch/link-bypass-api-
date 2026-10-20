@@ -4,7 +4,7 @@ import gc
 import sys
 import time
 import uuid
-import signal
+import atexit
 import resource
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -12,13 +12,17 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
 
+try:
+    from playwright_stealth import stealth_sync
+except ImportError:
+    def stealth_sync(page):
+        return None
+
 app = Flask(__name__)
 CORS(app)
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
 BROWSER_ARGS = [
     '--no-sandbox',
@@ -31,84 +35,47 @@ BROWSER_ARGS = [
     '--disable-features=IsolateOrigins,site-per-process',
     '--window-size=1280,800',
     '--renderer-process-limit=1',
-    '--js-flags=--max-old-space-size=192',
+    '--js-flags=--max-old-space-size=256',
 ]
 
-MEMORY_LIMIT_MB = 410.0
-MEMORY_HARD_ABORT_MB = 470.0
-SCREENSHOT_MIN_INTERVAL = 3.0
+MEMORY_LIMIT_MB = 420.0
+SCREENSHOT_MIN_INTERVAL = 2.5
 MUTATION_DEBOUNCE_MS = 1200
 NO_SEEN_LIMIT_SEC = 45.0
-DEADLINE_BUFFER_SEC = 50.0
-PREEMPTION_WAIT_SEC = 3.0
-MEMORY_CHECK_CACHE_SEC = 0.3
+DEADLINE_BUFFER_SEC = 60.0
+PREEMPTION_WAIT_SEC = 5.0
+MEMORY_CHECK_CACHE_SEC = 0.5
+POPUP_LIMIT = 2
 
 JOBS = {}
 JOB_LOCK = threading.RLock()
-EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hell-worker")
+ACTIVE_JOB_ID = None
+ACTIVE_JOB_LOCK = threading.Lock()
+EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="job-worker")
+atexit.register(lambda: EXECUTOR.shutdown(wait=False))
 
-_last_valid_rss = 45.0
 
 def current_rss_mb():
-    global _last_valid_rss
     try:
         with open('/proc/self/status', 'r') as f:
             for line in f:
                 if line.startswith('VmRSS:'):
                     parts = line.split()
-                    if len(parts) >= 2:
-                        val = int(parts[1]) / 1024.0
-                        if val > 0:
-                            _last_valid_rss = val
-                            return val
+                    return int(parts[1]) / 1024.0
     except Exception:
         pass
-
-    try:
-        with open('/proc/self/stat', 'r') as f:
-            data = f.read().split()
-            if len(data) > 23:
-                rss_pages = int(data[23])
-                page_size = os.sysconf('SC_PAGE_SIZE')
-                val = (rss_pages * page_size) / (1024.0 * 1024.0)
-                if val > 0:
-                    _last_valid_rss = val
-                    return val
-    except Exception:
-        pass
-
     try:
         usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if usage > 0:
-            val = usage / (1024.0 * 1024.0) if sys.platform == 'darwin' else usage / 1024.0
-            if val > 0:
-                _last_valid_rss = val
-                return val
+        if sys.platform == 'darwin':
+            return usage / (1024.0 * 1024.0)
+        return usage / 1024.0
     except Exception:
-        pass
-
-    return _last_valid_rss
+        return 0.0
 
 
-def sweep_zombie_chromium():
-    """Dọn dẹp tiến trình Chromium mồ côi hoàn toàn bằng Python thuần quét thư mục /proc (Không cần pgrep)"""
-    self_pid = os.getpid()
+def _abort_route(route):
     try:
-        for entry in os.listdir('/proc'):
-            if not entry.isdigit():
-                continue
-            pid = int(entry)
-            if pid == self_pid:
-                continue
-            try:
-                cmdline_path = f"/proc/{pid}/cmdline"
-                if os.path.exists(cmdline_path):
-                    with open(cmdline_path, 'rb') as f:
-                        cmdline = f.read().decode('utf-8', errors='ignore').lower()
-                        if 'chromium' in cmdline or 'chrome' in cmdline or 'chrome-sandbox' in cmdline:
-                            os.kill(pid, signal.SIGKILL)
-            except (PermissionError, ProcessLookupError, OSError):
-                continue
+        route.abort()
     except Exception:
         pass
 
@@ -154,7 +121,7 @@ class JobContext:
         try:
             mb = current_rss_mb()
         except Exception:
-            mb = _last_valid_rss
+            mb = 0.0
         with self._lock:
             self._last_mem_check = now
             self._last_mem_mb = mb
@@ -190,7 +157,6 @@ INIT_JS = r"""
     if (window.__l4m_initialized) return;
     window.__l4m_initialized = true;
 
-    // Capped Rolling Buffer cho Shadow Roots để chống rò rỉ V8 Heap (Max 25 items)
     window.__l4m_shadow_roots = [];
     try {
         const origAttach = Element.prototype.attachShadow;
@@ -199,9 +165,6 @@ INIT_JS = r"""
             try {
                 if (init && init.mode === 'closed') {
                     window.__l4m_shadow_roots.push(root);
-                    if (window.__l4m_shadow_roots.length > 25) {
-                        window.__l4m_shadow_roots.shift();
-                    }
                 }
             } catch (e) {}
             return root;
@@ -233,7 +196,9 @@ INIT_JS = r"""
         try {
             if (observed.has(root)) return;
             observed.add(root);
-        } catch (e) { return; }
+        } catch (e) {
+            return;
+        }
         try {
             const obs = new MutationObserver(markDirty);
             obs.observe(root, OBS_OPTS);
@@ -241,7 +206,7 @@ INIT_JS = r"""
     }
 
     function traverse(root, depth) {
-        if (!root || depth > 8) return;
+        if (!root || depth > 12) return;
         try {
             if (visitedDocs.has(root)) return;
             visitedDocs.add(root);
@@ -282,6 +247,18 @@ INIT_JS = r"""
         start();
     }
 
+    try {
+        if (window.top === window.self) {
+            setInterval(function () {
+                try {
+                    for (let i = 0; i < window.__l4m_shadow_roots.length; i++) {
+                        traverse(window.__l4m_shadow_roots[i], 1);
+                    }
+                } catch (e) {}
+            }, 2000);
+        }
+    } catch (e) {}
+
     window.__l4m_consume_screenshot_flag = function () {
         if (window.__l4m_dirty && (Date.now() - window.__l4m_last_mutation) >= DEBOUNCE_MS) {
             window.__l4m_dirty = false;
@@ -290,6 +267,14 @@ INIT_JS = r"""
         return false;
     };
 })();
+"""
+
+NAVIGATOR_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || { runtime: {} };
+Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'vendor', {get: () => 'Google Inc.'});
 """
 
 DEEP_QUERY_JS = r"""
@@ -329,7 +314,7 @@ FIND_JS = (
 const vis = (e) => {
     try {
         const r = e.getBoundingClientRect();
-        return e.offsetParent !== null && r.width > 15 && r.height > 8;
+        return e.offsetParent !== null && r.width > 20 && r.height > 10;
     } catch (err) { return false; }
 };
 const txt = (e) => ((e.innerText || e.value || '') + '').trim().toLowerCase();
@@ -449,17 +434,21 @@ MENU_JS = (
 
 
 def pause(ctx, seconds):
-    """Non-blocking preemption sleep: ngắt ngay lập tức khi có lệnh cancel/memory emergency mà không kẹt luồng"""
     if ctx.is_cancelled():
         return False
-    slept = 0.0
-    chunk = 0.2
-    while slept < seconds:
-        if ctx.is_cancelled() or ctx.memory_emergency:
+    if ctx.memory_emergency:
+        return False
+    end = time.time() + float(seconds)
+    while time.time() < end:
+        if ctx._cancel_event.wait(0.5):
             return False
-        time.sleep(chunk)
-        slept += chunk
-    return not ctx.is_cancelled()
+        if ctx.memory_emergency:
+            return False
+        if time.time() > ctx.absolute_deadline:
+            return False
+        if ctx.check_memory():
+            return False
+    return True
 
 
 def evaluate_in_frames(page, js):
@@ -477,13 +466,29 @@ def evaluate_in_frames(page, js):
     return None
 
 
-def read_code(page):
+def read_code_single(page):
     try:
         v = evaluate_in_frames(page, READ_JS)
         if v:
             return str(v).strip()
     except Exception:
         pass
+    return None
+
+
+def read_code_all_pages(page, popups):
+    v = read_code_single(page)
+    if v:
+        return v
+    for p in list(popups):
+        try:
+            if p.is_closed():
+                continue
+            r = p.evaluate(READ_JS)
+            if r:
+                return str(r).strip()
+        except Exception:
+            continue
     return None
 
 
@@ -501,7 +506,10 @@ def consume_screenshot_flag(page):
         return False
     for fr in frames:
         try:
-            r = fr.evaluate("() => (window.__l4m_consume_screenshot_flag && window.__l4m_consume_screenshot_flag()) || false")
+            r = fr.evaluate(
+                "() => (window.__l4m_consume_screenshot_flag && "
+                "window.__l4m_consume_screenshot_flag()) || false"
+            )
             if r:
                 return True
         except Exception:
@@ -519,8 +527,8 @@ def maybe_screenshot(ctx, page, force=False):
             return
     try:
         evaluate_in_frames(page, SCROLL_JS)
-        page.wait_for_timeout(200)
-        img = page.screenshot(type='jpeg', quality=40)
+        page.wait_for_timeout(300)
+        img = page.screenshot(type='jpeg', quality=50)
         with ctx._lock:
             ctx.last_shot_at = time.time()
             ctx.shot_buffer = img
@@ -551,7 +559,7 @@ def navigate(ctx, page, domain):
     if should_stop(ctx):
         return False
     try:
-        page.goto("https://" + domain, timeout=35000,
+        page.goto("https://" + domain, timeout=45000,
                   wait_until="domcontentloaded",
                   referer="https://www.google.com/")
         return True
@@ -567,7 +575,7 @@ def human_reading_scroll(ctx, page):
         page.evaluate("() => window.scrollBy({top: window.innerHeight * 0.5, behavior: 'smooth'})")
     except Exception:
         return
-    pause(ctx, 1.0)
+    pause(ctx, 1.2)
 
 
 def click_button(ctx, page, tries, gap):
@@ -580,7 +588,7 @@ def click_button(ctx, page, tries, gap):
             pass
         r = evaluate_in_frames(page, CLICK_JS)
         if r:
-            if not pause(ctx, 1.5):
+            if not pause(ctx, 2):
                 return None
             return r
         ctx.log("Không thấy nút, thử lại (%d/%d)" % (i + 1, tries))
@@ -589,15 +597,17 @@ def click_button(ctx, page, tries, gap):
     return None
 
 
-def countdown_for_code(ctx, page, cap):
+def countdown_for_code(ctx, page, popups, cap):
     t_start = time.time()
     seen = False
     quiet = 0
     last = None
     while (time.time() - t_start) < cap and time.time() < ctx.absolute_deadline:
-        if ctx.is_cancelled() or ctx.check_memory():
+        if ctx.is_cancelled():
             return None
-        c = read_code(page)
+        if ctx.check_memory():
+            return None
+        c = read_code_all_pages(page, popups)
         if c:
             return c
         txt = button_text(page) or ""
@@ -615,9 +625,9 @@ def countdown_for_code(ctx, page, cap):
         if (not seen) and (time.time() - t_start) > NO_SEEN_LIMIT_SEC:
             break
         human_reading_scroll(ctx, page)
-        if not pause(ctx, 2.5):
+        if not pause(ctx, 3):
             return None
-    return read_code(page)
+    return read_code_all_pages(page, popups)
 
 
 def click_menu_link(ctx, page):
@@ -627,8 +637,9 @@ def click_menu_link(ctx, page):
         k = evaluate_in_frames(page, MENU_JS)
         if k:
             ctx.log("Đã bấm vào trang phụ: '" + str(k) + "'")
-            pause(ctx, 3)
+            pause(ctx, 4)
             return True
+        ctx.log("Không tìm thấy link phụ phù hợp.")
     except Exception as e:
         ctx.log("Lỗi bấm link phụ: " + str(e)[:80])
     return False
@@ -637,7 +648,7 @@ def click_menu_link(ctx, page):
 def diag(ctx, page):
     try:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(500)
         info = page.evaluate("""() => ({
             t: document.title || '',
             h: document.body ? document.body.scrollHeight : 0,
@@ -650,21 +661,43 @@ def diag(ctx, page):
         ctx.log("Chẩn đoán lỗi: " + str(e)[:80])
 
 
+def attempt_get_code(ctx, page, popups, cap, tries):
+    if should_stop(ctx):
+        return ("stopped", None)
+    hit = click_button(ctx, page, tries=tries, gap=4)
+    if hit is None:
+        return ("no_button", None)
+    ctx.log("Đã bấm: " + str(hit))
+    code = countdown_for_code(ctx, page, popups, cap)
+    if should_stop(ctx):
+        return ("stopped", None)
+    return ("ok", code)
+
+
 def worker(job_id, domain, max_wait):
+    global ACTIVE_JOB_ID
+
     with JOB_LOCK:
         ctx = JOBS.get(job_id)
     if ctx is None:
         return
 
     ctx.absolute_deadline = ctx.t0 + float(max_wait) + DEADLINE_BUFFER_SEC
+
+    with ACTIVE_JOB_LOCK:
+        ACTIVE_JOB_ID = job_id
+
     browser = None
     context = None
+    popups = []
 
     try:
-        sweep_zombie_chromium()
+        if should_stop(ctx):
+            ctx.log("Huỷ trước khi khởi tạo trình duyệt.")
+            return
+
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=BROWSER_ARGS)
-
             try:
                 context = browser.new_context(
                     user_agent=USER_AGENT,
@@ -681,63 +714,104 @@ def worker(job_id, domain, max_wait):
                     },
                 )
 
-                # 🔴 Chặn tài nguyên hung hãn tối đa để tiết kiệm RAM (Images, Fonts, Media, Stylesheets không thiết yếu)
                 context.route(
-                    "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot,mp4,webm,avi,mkv,mp3,wav,ogg,flac}",
-                    lambda route: route.abort()
+                    "**/*.{mp4,webm,avi,mkv,mp3,wav,ogg,flac,m4a,aac,midi,mid}",
+                    _abort_route
                 )
 
                 context.add_init_script(INIT_JS)
-                context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    window.chrome = window.chrome || { runtime: {} };
-                    Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en-US', 'en']});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                    Object.defineProperty(navigator, 'vendor', {get: () => 'Google Inc.'});
-                """)
+                context.add_init_script(NAVIGATOR_JS)
 
                 page = context.new_page()
                 primary_ref = {"page": page}
 
-                page.on("dialog", lambda dialog: dialog.dismiss())
-                context.on("page", lambda popup: popup.close() if primary_ref["page"] and popup is not primary_ref["page"] else None)
+                def _dialog_handler(dialog):
+                    try:
+                        dialog.dismiss()
+                    except Exception:
+                        pass
+
+                page.on("dialog", _dialog_handler)
+
+                def _popup_handler(popup):
+                    try:
+                        if primary_ref["page"] is not None and popup is primary_ref["page"]:
+                            return
+                        popups.append(popup)
+                        while len(popups) > POPUP_LIMIT:
+                            old = popups.pop(0)
+                            try:
+                                if not old.is_closed():
+                                    old.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                context.on("page", _popup_handler)
+
+                try:
+                    stealth_sync(page)
+                except Exception:
+                    pass
 
                 ctx.log("Bước 1: Mở trang đích: " + domain)
                 if not navigate(ctx, page, domain):
-                    ctx.log("Dừng trước khi tải xong.")
+                    ctx.log("Dừng trước khi trang tải xong (cancelled/memory/deadline).")
                     return
 
-                if not pause(ctx, 3):
+                if not pause(ctx, 4):
                     ctx.log("Huỷ trong lúc chờ trang tải.")
                     return
                 if ctx.check_memory():
-                    ctx.log("Áp lực RAM sau khi mở trang.")
+                    ctx.log("Áp lực RAM cao sau khi mở trang.")
                     return
+
                 maybe_screenshot(ctx, page, force=True)
 
-                code = read_code(page)
+                code = read_code_all_pages(page, popups)
 
                 if not code:
                     ctx.log("Bước 2: Tìm nút LẤY MÃ (lần 1)...")
-                    status, code = attempt_get_code(ctx, page, cap=50, tries=4)
+                    status, code = attempt_get_code(ctx, page, popups, cap=60, tries=5)
+
                     if status == "stopped":
-                        return
-                    if status == "no_button":
-                        diag(ctx, page)
-                        maybe_screenshot(ctx, page, force=True)
-                        with ctx._lock:
-                            if ctx.result is None:
-                                ctx.result = {"code": None, "exception": "no_button", "url": safe_url(page)}
+                        ctx.log("Dừng trong bước 2.")
                         return
 
-                    if not code:
-                        ctx.log("Bước 3: Bấm link phụ trong trang...")
+                    if status == "no_button" and not code:
+                        ctx.log("Không thấy nút lần 1, thử bấm link phụ...")
                         click_menu_link(ctx, page)
                         if should_stop(ctx):
+                            ctx.log("Dừng sau khi bấm link phụ (lần 1).")
+                            return
+                        ctx.log("Bước 3: Tìm nút LẤY MÃ (lần 2)...")
+                        status, code = attempt_get_code(ctx, page, popups, cap=140, tries=4)
+                        if status == "stopped":
+                            ctx.log("Dừng trong bước 3.")
+                            return
+                        if status == "no_button" and not code:
+                            diag(ctx, page)
+                            maybe_screenshot(ctx, page, force=True)
+                            ctx.log("Trang đích không hiện nút LẤY MÃ cho máy chủ.")
+                            with ctx._lock:
+                                if ctx.result is None:
+                                    ctx.result = {
+                                        "code": None,
+                                        "exception": "no_button",
+                                        "url": safe_url(page)
+                                    }
+                            return
+                    elif not code:
+                        ctx.log("Bước 3: Bấm link phụ để làm mới...")
+                        click_menu_link(ctx, page)
+                        if should_stop(ctx):
+                            ctx.log("Dừng sau khi bấm link phụ (lần 2).")
                             return
                         ctx.log("Bước 4: Tìm nút LẤY MÃ (lần 2)...")
-                        status, code = attempt_get_code(ctx, page, cap=120, tries=3)
+                        status, code = attempt_get_code(ctx, page, popups, cap=140, tries=4)
                         if status == "stopped":
+                            ctx.log("Dừng trong bước 4.")
                             return
 
                     tries = 0
@@ -747,9 +821,9 @@ def worker(job_id, domain, max_wait):
                         tries += 1
                         ctx.log("Chưa thấy mã, quét lại (%d/3)..." % tries)
                         evaluate_in_frames(page, CLICK_JS)
-                        if not pause(ctx, 6):
+                        if not pause(ctx, 8):
                             break
-                        code = read_code(page)
+                        code = read_code_all_pages(page, popups)
 
                 if code:
                     ctx.log("ĐÃ CÓ MÃ: " + code)
@@ -761,29 +835,41 @@ def worker(job_id, domain, max_wait):
 
                 with ctx._lock:
                     ctx.result = {"code": code, "url": safe_url(page)}
+
             except Exception as e:
-                ctx.log("LỖI CHÍNH: " + str(e)[:200])
+                ctx.log("LỖI TRONG LUỒNG CHÍNH: " + str(e)[:200])
                 with ctx._lock:
                     if ctx.result is None:
                         ctx.result = {"code": None, "exception": str(e)[:500]}
             finally:
                 try:
-                    if context:
-                        context.close()
+                    context.close()
                 except Exception:
                     pass
                 try:
-                    if browser:
-                        browser.close()
+                    browser.close()
                 except Exception:
                     pass
     except Exception as e:
-        ctx.log("LỖI KHỞI TẠO: " + str(e)[:200])
+        ctx.log("LỖI KHỞI TẠO TRÌNH DUYỆT: " + str(e)[:200])
         with ctx._lock:
             if ctx.result is None:
                 ctx.result = {"code": None, "exception": str(e)[:500]}
     finally:
-        sweep_zombie_chromium()
+        for p in list(popups):
+            try:
+                p.close()
+            except Exception:
+                pass
+        try:
+            popups.clear()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
         try:
             gc.collect(2)
         except Exception:
@@ -791,7 +877,11 @@ def worker(job_id, domain, max_wait):
         if ctx.memory_emergency:
             with ctx._lock:
                 if ctx.result is None:
-                    ctx.result = {"code": None, "exception": "memory_emergency", "recovered": True}
+                    ctx.result = {
+                        "code": None,
+                        "exception": "memory_emergency",
+                        "recovered": True
+                    }
                 elif isinstance(ctx.result, dict):
                     ctx.result.setdefault("recovered", True)
         if ctx.is_cancelled():
@@ -800,8 +890,11 @@ def worker(job_id, domain, max_wait):
                     ctx.result = {"code": None, "exception": "cancelled"}
                 elif isinstance(ctx.result, dict):
                     ctx.result.setdefault("cancelled", True)
-        ctx.log("Hoàn tất | RSS=" + str(round(current_rss_mb(), 1)) + "MB")
+        ctx.log("Hoàn thành tiến trình | RSS=" + str(round(current_rss_mb(), 1)) + "MB")
         ctx.mark_done()
+        with ACTIVE_JOB_LOCK:
+            if ACTIVE_JOB_ID == job_id:
+                ACTIVE_JOB_ID = None
 
 
 @app.route('/health', methods=['GET'])
@@ -813,54 +906,51 @@ def health():
 def getcode_endpoint():
     if request.method == 'OPTIONS':
         return '', 204
-
-    current_mem = current_rss_mb()
-    
-    # 🔴 Adaptive Gate: Từ chối cứng lập tức khi RAM vượt ngưỡng nguy hiểm
-    if current_mem > MEMORY_HARD_ABORT_MB:
-        return jsonify({
-            "error": "Server under critical memory pressure. Please retry later.",
-            "rss_mb": round(current_mem, 1)
-        }), 530
-
     domain = (request.args.get('domain') or '').strip()
     domain = domain.replace('https://', '').replace('http://', '').split('/')[0]
     if not domain:
         return jsonify({"error": "Thiếu tham số domain"}), 400
-
     try:
-        max_wait = max(30, min(500, int(request.args.get('wait', 420))))
+        max_wait = max(30, min(570, int(request.args.get('wait', 480))))
     except ValueError:
-        max_wait = 420
+        max_wait = 480
 
     obsolete_ctx = None
     job_id = None
-
     with JOB_LOCK:
-        if current_mem > MEMORY_LIMIT_MB:
-            for jid, jctx in list(JOBS.items()):
-                if jctx.is_running():
-                    obsolete_ctx = jctx
-                    jctx.cancel()
-                    break
-
         for jid, jctx in list(JOBS.items()):
-            if jctx.is_running() and jctx.domain == domain:
-                return jsonify({"id": jid, "reused": True})
+            if jctx.is_running():
+                if jctx.domain == domain:
+                    return jsonify({"id": jid, "status": "running", "reused": True})
+                obsolete_ctx = jctx
+                jctx.cancel()
 
         job_id = uuid.uuid4().hex[:8]
         new_ctx = JobContext(job_id=job_id, domain=domain)
         JOBS[job_id] = new_ctx
 
         done_ids = [jid for jid, jctx in JOBS.items() if jctx.done_event.is_set()]
-        while len(JOBS) > 4 and done_ids:
+        while len(JOBS) > 5 and done_ids:
             del JOBS[done_ids.pop(0)]
 
     if obsolete_ctx is not None:
-        obsolete_ctx.wait_done(timeout=PREEMPTION_WAIT_SEC)
+        with ACTIVE_JOB_LOCK:
+            is_active = obsolete_ctx.job_id == ACTIVE_JOB_ID
+        if is_active:
+            obsolete_ctx.wait_done(timeout=PREEMPTION_WAIT_SEC)
 
-    EXECUTOR.submit(worker, job_id, domain, max_wait)
-    return jsonify({"id": job_id, "status": "running", "rss_mb": round(current_mem, 1)})
+    try:
+        EXECUTOR.submit(worker, job_id, domain, max_wait)
+    except RuntimeError:
+        with JOB_LOCK:
+            jctx = JOBS.get(job_id)
+            if jctx is not None:
+                with jctx._lock:
+                    jctx.result = {"code": None, "exception": "executor_shutdown"}
+                jctx.mark_done()
+        return jsonify({"error": "executor_unavailable"}), 503
+
+    return jsonify({"id": job_id, "status": "running"})
 
 
 @app.route('/cancel', methods=['GET'])
