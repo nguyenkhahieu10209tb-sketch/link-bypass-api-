@@ -36,7 +36,6 @@ class Stop(Exception):
 
 # ---- Các đoạn JavaScript chạy trong trang đích ----
 
-# Ưu tiên tìm nút L4M Lấy mã / logo L4M, sau đó mới đến các nút chung chung
 FIND_JS = """
 const vis = e => { const r = e.getBoundingClientRect(); return e.offsetParent !== null && r.width > 20 && r.height > 10; };
 const txt = e => ((e.innerText || e.value || '') + '').trim().toLowerCase();
